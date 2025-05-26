@@ -67,6 +67,11 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         lines: usize,
     },
+    /// Diagnose binary file issues
+    Diagnose {
+        /// Task name or ID
+        task: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -219,6 +224,36 @@ impl TaskManager {
             return Err("Task is already running".into());
         }
 
+        // Check if binary exists and is executable
+        let binary_path = std::path::Path::new(&task.binary);
+        if !binary_path.exists() {
+            return Err(format!("❌ Binary file does not exist: {}", task.binary).into());
+        }
+
+        // Check if file is executable on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&task.binary)?;
+            let permissions = metadata.permissions();
+            if permissions.mode() & 0o111 == 0 {
+                return Err(format!("❌ Binary file is not executable: {}\n💡 Fix with: chmod +x {}", task.binary, task.binary).into());
+            }
+        }
+
+        // Check if it's a script and has proper shebang
+        let mut file = std::fs::File::open(&task.binary)?;
+        let mut buffer = [0; 512];
+        use std::io::Read;
+        let bytes_read = file.read(&mut buffer).unwrap_or(0);
+        
+        if bytes_read >= 2 && buffer[0] == 0x23 && buffer[1] == 0x21 { // "#!" shebang
+            println!("📝 Detected script file with shebang");
+        } else if buffer.iter().take(bytes_read).all(|&b| b.is_ascii() && b != 0) {
+            println!("⚠️  Detected text file without shebang");
+            println!("💡 If this is a shell script, add '#!/bin/bash' as the first line");
+        }
+
         let mut cmd = Command::new(&task.binary);
         cmd.args(&task.args);
         
@@ -233,18 +268,40 @@ impl TaskManager {
         cmd.stdout(Stdio::piped())
            .stderr(Stdio::piped());
 
-        let child = cmd.spawn()?;
-        let pid = child.id();
-
-        self.running_processes.insert(task.id.clone(), child);
-        
-        if let Some(task_mut) = self.find_task_mut(identifier) {
-            task_mut.status = TaskStatus::Running;
-            task_mut.pid = Some(pid);
+        println!("🚀 Starting task '{}' with binary: {}", task.name, task.binary);
+        if !task.args.is_empty() {
+            println!("   Arguments: {:?}", task.args);
+        }
+        if !task.env.is_empty() {
+            println!("   Environment variables: {} vars", task.env.len());
+        }
+        if let Some(ref workdir) = task.workdir {
+            println!("   Working directory: {}", workdir);
         }
 
-        self.save()?;
-        println!("Task '{}' started with PID {}", task.name, pid);
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                self.running_processes.insert(task.id.clone(), child);
+                
+                if let Some(task_mut) = self.find_task_mut(identifier) {
+                    task_mut.status = TaskStatus::Running;
+                    task_mut.pid = Some(pid);
+                }
+
+                self.save()?;
+                println!("✅ Task '{}' started successfully with PID {}", task.name, pid);
+            }
+            Err(e) => {
+                if let Some(task_mut) = self.find_task_mut(identifier) {
+                    task_mut.status = TaskStatus::Failed;
+                }
+                self.save()?;
+                return Err(format!("❌ Failed to start task '{}': {}\n\n💡 Troubleshooting tips:\n   1. Check if file exists: ls -la {}\n   2. Make executable: chmod +x {}\n   3. If it's a script, ensure it has shebang: head -1 {}\n   4. Test manually: {}\n   5. Use 'hyperV diagnose {}' for detailed analysis", 
+                    task.name, e, task.binary, task.binary, task.binary, task.binary, task.name).into());
+            }
+        }
+
         Ok(())
     }
 
@@ -344,6 +401,156 @@ impl TaskManager {
             println!("Task '{}' not found", identifier);
         }
     }
+
+    fn diagnose_task(&self, identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let task = self.find_task(identifier)
+            .ok_or(format!("Task '{}' not found", identifier))?;
+
+        println!("🔍 Diagnosing task: {}", task.name);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        
+        let binary_path = std::path::Path::new(&task.binary);
+        
+        // Check if file exists
+        if !binary_path.exists() {
+            println!("❌ File does not exist: {}", task.binary);
+            println!("💡 Make sure the path is correct and the file exists");
+            return Ok(());
+        }
+        println!("✅ File exists: {}", task.binary);
+
+        // Check file metadata
+        let metadata = std::fs::metadata(&task.binary)?;
+        println!("📊 File size: {} bytes", metadata.len());
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = metadata.permissions();
+            let mode = permissions.mode();
+            println!("🔐 Permissions: {:o}", mode & 0o777);
+            
+            if mode & 0o111 == 0 {
+                println!("❌ File is not executable");
+                println!("💡 Fix with: chmod +x {}", task.binary);
+            } else {
+                println!("✅ File is executable");
+            }
+        }
+
+        // Check file type and content
+        let mut file = std::fs::File::open(&task.binary)?;
+        let mut buffer = [0; 512];
+        use std::io::Read;
+        let bytes_read = file.read(&mut buffer)?;
+        
+        if bytes_read >= 2 && buffer[0] == 0x23 && buffer[1] == 0x21 { // "#!"
+            let shebang_line = String::from_utf8_lossy(&buffer[..bytes_read])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            println!("✅ Script with shebang: {}", shebang_line);
+            
+            // Check if shebang interpreter exists
+            let interpreter = shebang_line.trim_start_matches("#!")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if !interpreter.is_empty() {
+                let interpreter_path = std::path::Path::new(interpreter);
+                if interpreter_path.exists() {
+                    println!("✅ Interpreter exists: {}", interpreter);
+                } else {
+                    println!("❌ Interpreter not found: {}", interpreter);
+                    println!("💡 Install the interpreter or fix the shebang path");
+                }
+            }
+        } else if bytes_read >= 4 && buffer[..4] == [0x7f, 0x45, 0x4c, 0x46] { // ELF magic
+            println!("✅ ELF binary file");
+        } else if bytes_read >= 4 && buffer[..4] == [0xfe, 0xed, 0xfa, 0xce] { // Mach-O magic (little endian)
+            println!("✅ Mach-O binary file (macOS)");
+        } else if bytes_read >= 4 && buffer[..4] == [0xce, 0xfa, 0xed, 0xfe] { // Mach-O magic (big endian)  
+            println!("✅ Mach-O binary file (macOS)");
+        } else if buffer.iter().take(bytes_read).all(|&b| b.is_ascii() && b != 0) {
+            println!("⚠️  Text file without shebang");
+            println!("💡 If this is a script, add a shebang line:");
+            println!("   #!/bin/bash          (for bash scripts)");
+            println!("   #!/bin/sh            (for shell scripts)");
+            println!("   #!/usr/bin/env python3  (for Python scripts)");
+            println!("   #!/usr/bin/env node  (for Node.js scripts)");
+        } else {
+            println!("❓ Binary file (unknown format)");
+        }
+
+        // Show first few lines if it's a text file
+        if buffer.iter().take(bytes_read).all(|&b| b.is_ascii() && b != 0) {
+            println!("\n📄 First few lines of file:");
+            let content = String::from_utf8_lossy(&buffer[..bytes_read]);
+            for (i, line) in content.lines().take(5).enumerate() {
+                println!("   {}: {}", i + 1, line);
+            }
+        }
+
+        // Test basic execution
+        println!("\n🧪 Testing basic execution...");
+        let mut test_command = std::process::Command::new(&task.binary);
+        test_command.arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        
+        match test_command.spawn() {
+            Ok(mut child) => {
+                match child.wait() {
+                    Ok(status) => {
+                        if status.success() {
+                            println!("✅ Binary executes successfully");
+                        } else {
+                            println!("⚠️  Binary runs but exits with non-zero status");
+                        }
+                    }
+                    Err(e) => println!("⚠️  Binary execution test failed: {}", e),
+                }
+            }
+            Err(e) => {
+                println!("❌ Cannot execute binary: {}", e);
+                
+                // Provide specific suggestions based on error
+                match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        println!("💡 Permission denied - try: chmod +x {}", task.binary);
+                    }
+                    std::io::ErrorKind::NotFound => {
+                        println!("💡 File not found or missing interpreter");
+                    }
+                    _ => {
+                        println!("💡 Error details: {}", e);
+                        println!("💡 Try running manually: {}", task.binary);
+                    }
+                }
+            }
+        }
+
+        // Show task configuration
+        println!("\n⚙️  Task Configuration:");
+        println!("   Name: {}", task.name);
+        println!("   Binary: {}", task.binary);
+        if !task.args.is_empty() {
+            println!("   Arguments: {:?}", task.args);
+        }
+        if !task.env.is_empty() {
+            println!("   Environment variables:");
+            for (key, value) in &task.env {
+                println!("     {}={}", key, value);
+            }
+        }
+        if let Some(ref workdir) = task.workdir {
+            println!("   Working directory: {}", workdir);
+        }
+        println!("   Auto-restart: {}", task.auto_restart);
+
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -379,6 +586,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Logs { task, lines } => {
             task_manager.show_logs(&task, lines);
+        }
+        Commands::Diagnose { task } => {
+            task_manager.diagnose_task(&task)?;
         }
     }
 
