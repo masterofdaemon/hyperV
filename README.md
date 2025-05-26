@@ -5,14 +5,21 @@ A command-line service manager for running and managing binary files on Linux an
 ## Features
 
 - ✅ Create and manage tasks/services
-- ✅ Start/stop services
+- ✅ Start/stop services with graceful shutdown
 - ✅ Environment variable support
 - ✅ Custom working directories
 - ✅ Auto-restart configuration
-- ✅ Task status monitoring
+- ✅ Task status monitoring with detailed information
 - ✅ Cross-platform support (Linux & macOS)
-- 🔄 Persistent task configuration
-- 🔄 Process monitoring
+- ✅ Persistent task configuration
+- ✅ Process monitoring with PID tracking
+- ✅ Log management with rotation (>10MB)
+- ✅ Real-time log following (--follow flag)
+- ✅ Separate stdout/stderr log viewing
+- ✅ Enhanced process management with signal handling
+- ✅ Diagnostic tools for troubleshooting
+- ✅ Exit code tracking
+- ✅ Restart count monitoring
 
 ## Installation
 
@@ -77,17 +84,72 @@ hyperV status
 hyperV remove my-service
 ```
 
-### View logs (placeholder)
+### View logs
 
 ```bash
+# Show last 50 lines of stdout (default)
+hyperV logs my-service
+
+# Show last 100 lines of stdout
 hyperV logs my-service --lines 100
+
+# Show stderr logs
+hyperV logs my-service --log-type stderr
+
+# Show both stdout and stderr
+hyperV logs my-service --log-type both
+
+# Follow logs in real-time (like tail -f)
+hyperV logs my-service --follow
+
+# Follow stderr logs in real-time
+hyperV logs my-service --log-type stderr --follow
 ```
+
+### Diagnose task issues
+
+```bash
+# Analyze binary file and configuration for issues
+hyperV diagnose my-service
+```
+
+## Advanced Features
+
+### Auto-restart
+Tasks with `--auto-restart` flag will automatically restart if they fail (up to 5 attempts):
+
+```bash
+hyperV new --name "critical-service" --binary "/path/to/service" --auto-restart
+```
+
+### Log Management
+- Logs are automatically rotated when they exceed 10MB
+- Separate stdout and stderr log files
+- Real-time log following capability
+- Historical log preservation (.old files)
+
+### Process Management
+- Graceful shutdown with SIGTERM before SIGKILL
+- Process group handling for shell scripts
+- Proper cleanup of zombie processes
+- Exit code tracking
+
+### Enhanced Status Information
+The status command now shows:
+- Last start time
+- Restart count
+- Last exit code
+- Detailed process information
 
 ## Configuration
 
 Tasks are stored in JSON format at:
 - macOS: `~/Library/Application Support/hyperV/tasks.json`
 - Linux: `~/.config/hyperV/tasks.json`
+
+Logs are stored in:
+- macOS: `~/Library/Application Support/hyperV/logs/<task-id>/`
+- Linux: `~/.config/hyperV/logs/<task-id>/`
 
 ## Task Structure
 
@@ -102,6 +164,11 @@ Each task contains:
 - `status`: Current status (Running/Stopped/Failed)
 - `pid`: Process ID when running
 - `created_at`: Creation timestamp
+- `last_started`: Last start timestamp
+- `restart_count`: Number of automatic restarts
+- `last_exit_code`: Exit code from last run
+- `stdout_log_path`: Path to stdout log file
+- `stderr_log_path`: Path to stderr log file
 
 ## Examples
 
