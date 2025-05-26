@@ -66,6 +66,9 @@ enum Commands {
         /// Number of lines to show
         #[arg(short, long, default_value = "50")]
         lines: usize,
+        /// Log type to show
+        #[arg(short, long, default_value = "stdout")]
+        log_type: String, // "stdout" or "stderr"
     },
     /// Diagnose binary file issues
     Diagnose {
@@ -86,6 +89,8 @@ struct Task {
     status: TaskStatus,
     created_at: String,
     pid: Option<u32>,
+    stdout_log_path: Option<String>,
+    stderr_log_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -154,8 +159,16 @@ impl TaskManager {
             }
         }
 
+        let id = Uuid::new_v4().to_string();
+        let config_dir = dirs::config_dir()
+            .ok_or("Could not find config directory")?
+            .join("hyperV");
+        let logs_dir = config_dir.join("logs").join(&id);
+        fs::create_dir_all(&logs_dir)?;
+        let stdout_log_path = logs_dir.join("stdout.log");
+        let stderr_log_path = logs_dir.join("stderr.log");
         let task = Task {
-            id: Uuid::new_v4().to_string(),
+            id,
             name,
             binary,
             args,
@@ -165,6 +178,8 @@ impl TaskManager {
             status: TaskStatus::Stopped,
             created_at: chrono::Utc::now().to_rfc3339(),
             pid: None,
+            stdout_log_path: Some(stdout_log_path.to_string_lossy().to_string()),
+            stderr_log_path: Some(stderr_log_path.to_string_lossy().to_string()),
         };
 
         self.tasks.push(task);
@@ -256,17 +271,41 @@ impl TaskManager {
 
         let mut cmd = Command::new(&task.binary);
         cmd.args(&task.args);
-        
         for (key, value) in &task.env {
             cmd.env(key, value);
         }
-
         if let Some(workdir) = &task.workdir {
             cmd.current_dir(workdir);
         }
-
-        cmd.stdout(Stdio::piped())
-           .stderr(Stdio::piped());
+        // Setup log files
+        let stdout_log_path;
+        let stderr_log_path;
+        
+        if let (Some(out), Some(err)) = (&task.stdout_log_path, &task.stderr_log_path) {
+            stdout_log_path = out.clone();
+            stderr_log_path = err.clone();
+        } else {
+            // Backward compatibility for old tasks
+            let config_dir = dirs::config_dir()
+                .ok_or("Could not find config directory")?
+                .join("hyperV");
+            let logs_dir = config_dir.join("logs").join(&task.id);
+            fs::create_dir_all(&logs_dir)?;
+            let out = logs_dir.join("stdout.log");
+            let err = logs_dir.join("stderr.log");
+            stdout_log_path = out.to_string_lossy().to_string();
+            stderr_log_path = err.to_string_lossy().to_string();
+            
+            if let Some(task_mut) = self.find_task_mut(identifier) {
+                task_mut.stdout_log_path = Some(stdout_log_path.clone());
+                task_mut.stderr_log_path = Some(stderr_log_path.clone());
+                self.save()?;
+            }
+        }
+        let stdout_file = fs::OpenOptions::new().create(true).append(true).open(&stdout_log_path)?;
+        let stderr_file = fs::OpenOptions::new().create(true).append(true).open(&stderr_log_path)?;
+        cmd.stdout(Stdio::from(stdout_file));
+        cmd.stderr(Stdio::from(stderr_file));
 
         println!("🚀 Starting task '{}' with binary: {}", task.name, task.binary);
         if !task.args.is_empty() {
@@ -393,10 +432,56 @@ impl TaskManager {
         println!("Created: {}", task.created_at);
     }
 
-    fn show_logs(&self, identifier: &str, _lines: usize) {
-        if let Some(_task) = self.find_task(identifier) {
-            println!("Log viewing functionality will be implemented in future versions.");
-            println!("For now, you can check system logs or redirect output when starting tasks.");
+    fn show_logs(&self, identifier: &str, lines: usize, log_type: &str) {
+        if let Some(task) = self.find_task(identifier) {
+            let log_paths = match log_type {
+                "stdout" => task.stdout_log_path.as_ref().map(|p| vec![p]),
+                "stderr" => task.stderr_log_path.as_ref().map(|p| vec![p]),
+                "both" | _ => {
+                    let mut paths = Vec::new();
+                    if let Some(stdout) = &task.stdout_log_path {
+                        paths.push(stdout);
+                    }
+                    if let Some(stderr) = &task.stderr_log_path {
+                        paths.push(stderr);
+                    }
+                    if paths.is_empty() { None } else { Some(paths) }
+                }
+            };
+
+            if let Some(paths) = log_paths {
+                for (i, log_path) in paths.iter().enumerate() {
+                    if paths.len() > 1 {
+                        println!("=== {} ===", if i == 0 { "STDOUT" } else { "STDERR" });
+                    }
+                    
+                    let path = std::path::Path::new(log_path);
+                    if !path.exists() {
+                        println!("Log file does not exist: {}", log_path);
+                        continue;
+                    }
+                    
+                    let content = match fs::read_to_string(path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            println!("Failed to read log file: {}", e);
+                            continue;
+                        }
+                    };
+                    
+                    let lines_vec: Vec<&str> = content.lines().collect();
+                    let start = if lines_vec.len() > lines { lines_vec.len() - lines } else { 0 };
+                    for line in &lines_vec[start..] {
+                        println!("{}", line);
+                    }
+                    
+                    if paths.len() > 1 && i < paths.len() - 1 {
+                        println!(); // Add blank line between stdout and stderr
+                    }
+                }
+            } else {
+                println!("No log files configured for this task.");
+            }
         } else {
             println!("Task '{}' not found", identifier);
         }
@@ -584,8 +669,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Status { task } => {
             task_manager.show_status(task.as_deref());
         }
-        Commands::Logs { task, lines } => {
-            task_manager.show_logs(&task, lines);
+        Commands::Logs { task, lines, log_type } => {
+            task_manager.show_logs(&task, lines, &log_type);
         }
         Commands::Diagnose { task } => {
             task_manager.diagnose_task(&task)?;
