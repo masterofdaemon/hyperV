@@ -43,7 +43,48 @@ async fn main() -> Result<()> {
         Commands::Diagnose { task } => {
             task_manager.diagnose_task(&task)?;
         }
+        Commands::Daemon => {
+            // Run in daemon mode - monitoring and auto-restarting tasks
+            run_daemon_mode(task_manager).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_daemon_mode(mut task_manager: TaskManager) -> Result<()> {
+    use hyperV::constants::MAIN_LOOP_INTERVAL;
+    use tokio::time::sleep;
+    use tokio::signal;
+    
+    println!("🚀 Starting hyperV daemon mode...");
+    println!("📋 Monitoring {} tasks ({} with auto-restart)", 
+        task_manager.task_count(), 
+        task_manager.tasks_with_autorestart_count());
+    println!("💡 Use 'hyperV list' to check task status");
+    println!("🛑 Press Ctrl+C to stop daemon");
+
+    // Set up signal handler for graceful shutdown
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("\n🛑 Received shutdown signal, stopping daemon...");
+                break;
+            }
+            _ = sleep(MAIN_LOOP_INTERVAL) => {
+                if let Err(e) = task_manager.cleanup() {
+                    eprintln!("Error during cleanup: {}", e);
+                }
+                if let Err(e) = task_manager.check_and_restart_tasks() {
+                    eprintln!("Error during task restart check: {}", e);
+                }
+            }
+        }
+    }
+
+    println!("✅ Daemon stopped gracefully");
     Ok(())
 }

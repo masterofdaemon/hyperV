@@ -249,19 +249,31 @@ impl ProcessManager {
         self.running_processes.len()
     }
 
-    /// Clean up zombie processes
-    pub fn cleanup_zombies(&mut self) {
+    /// Clean up zombie processes and update their exit codes
+    pub fn cleanup_zombies(&mut self) -> HashMap<String, i32> {
         let mut to_remove = Vec::new();
+        let mut exit_codes = HashMap::new();
         
         for (task_id, child) in &mut self.running_processes {
-            if let Ok(Some(_)) = child.try_wait() {
-                to_remove.push(task_id.clone());
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    to_remove.push(task_id.clone());
+                    if let Some(code) = status.code() {
+                        exit_codes.insert(task_id.clone(), code);
+                    }
+                }
+                Ok(None) => { /* Still running */ }
+                Err(e) => {
+                    eprintln!("Error waiting for child process {}: {}", task_id, e);
+                    to_remove.push(task_id.clone()); // Remove to avoid repeated errors
+                }
             }
         }
         
         for task_id in to_remove {
             self.running_processes.remove(&task_id);
         }
+        exit_codes
     }
 }
 

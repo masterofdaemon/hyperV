@@ -76,5 +76,7 @@ pub enum Commands {
         /// Task name or ID
         task: String,
     },
+    /// Run in daemon mode (monitor and auto-restart tasks)
+    Daemon,
 }
 

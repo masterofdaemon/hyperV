@@ -34,6 +34,9 @@ pub mod constants {
     /// Process shutdown timeout (SIGTERM to SIGKILL)
     pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
     
+    /// Main loop interval for checking and restarting tasks
+    pub const MAIN_LOOP_INTERVAL: Duration = Duration::from_secs(5);
+    
     /// Default number of log lines to show
     pub const DEFAULT_LOG_LINES: usize = 50;
 }

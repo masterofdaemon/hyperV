@@ -129,9 +129,14 @@ impl LogManager {
     fn show_single_log(log_path: &Path, log_name: &str, lines: usize, follow: bool) -> Result<()> {
         println!("=== {} ===", log_name);
         
-        let log_lines = Self::read_log_lines(log_path, lines)?;
-        for line in log_lines {
-            println!("{}", line);
+        // Always show the most recent content
+        if log_path.exists() {
+            let log_lines = Self::read_log_lines(log_path, lines)?;
+            for line in log_lines {
+                println!("{}", line);
+            }
+        } else {
+            println!("Log file not found: {}", log_path.display());
         }
 
         if follow {
@@ -159,16 +164,33 @@ impl LogManager {
         let mut reader = BufReader::new(file);
         let mut line = String::new();
 
+        println!("📖 Following log file: {} (Press Ctrl+C to stop)", log_path.display());
+        
         loop {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
                     // No new data, sleep and try again
                     thread::sleep(LOG_FOLLOW_INTERVAL);
+                    
+                    // Check if file was rotated or recreated
+                    if let Ok(new_file) = File::open(log_path) {
+                        let new_metadata = new_file.metadata().map_err(HyperVError::Io)?;
+                        let current_metadata = reader.get_ref().metadata().map_err(HyperVError::Io)?;
+                        
+                        // If file size decreased or inode changed, file was rotated
+                        if new_metadata.len() < current_metadata.len() {
+                            println!("🔄 Log file rotated, reopening...");
+                            file = new_file;
+                            reader = BufReader::new(file);
+                        }
+                    }
                     continue;
                 }
                 Ok(_) => {
-                    print!("{}", line);
+                    // Print with timestamp
+                    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    print!("[{}] {}", timestamp, line);
                 }
                 Err(e) => {
                     eprintln!("Error reading log: {}", e);

@@ -355,32 +355,33 @@ impl TaskManager {
             .iter()
             .filter(|task| {
                 task.auto_restart && 
-                task.status == TaskStatus::Running && 
-                task.pid.map_or(false, |pid| !self.process_manager.is_process_running(pid))
+                task.status == TaskStatus::Failed && 
+                task.restart_count <= MAX_RESTART_ATTEMPTS
             })
             .map(|task| task.id.clone())
             .collect();
 
         for task_id in tasks_to_restart {
             if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                println!("🔄 Auto-restarting failed task: {}", task.name);
-                task.set_status(TaskStatus::Failed);
-                task.clear_pid();
-                task.increment_restart_count();
+                println!("🔄 Auto-restarting failed task: {} (attempt {}/{})", 
+                    task.name, task.restart_count + 1, MAX_RESTART_ATTEMPTS);
                 
-                if task.restart_count <= MAX_RESTART_ATTEMPTS {
-                    let task_name = task.name.clone();
-                    self.save()?;
-                    
-                    // Small delay before restart
-                    std::thread::sleep(RESTART_DELAY);
-                    
-                    if let Err(e) = self.start_task(&task_name) {
-                        println!("❌ Failed to auto-restart task '{}': {}", task_name, e);
+                task.increment_restart_count();
+                let task_name = task.name.clone();
+                self.save()?;
+                
+                // Small delay before restart
+                std::thread::sleep(RESTART_DELAY);
+                
+                if let Err(e) = self.start_task(&task_name) {
+                    println!("❌ Failed to auto-restart task '{}': {}", task_name, e);
+                    // Mark as failed again if restart fails
+                    if let Some(task_mut) = self.find_task_mut(&task_name) {
+                        task_mut.set_status(TaskStatus::Failed);
                     }
+                    self.save()?;
                 } else {
-                    println!("⚠️  Task '{}' has exceeded maximum restart attempts ({})", 
-                        task.name, MAX_RESTART_ATTEMPTS);
+                    println!("✅ Task '{}' restarted successfully", task_name);
                 }
             }
         }
@@ -422,9 +423,14 @@ impl TaskManager {
         self.tasks.iter().filter(|t| t.status == TaskStatus::Running).count()
     }
 
+    /// Get the number of tasks with auto-restart enabled
+    pub fn tasks_with_autorestart_count(&self) -> usize {
+        self.tasks.iter().filter(|t| t.auto_restart).count()
+    }
+
     /// Clean up zombie processes and update task states
     pub fn cleanup(&mut self) -> Result<()> {
-        self.process_manager.cleanup_zombies();
+        let exit_codes = self.process_manager.cleanup_zombies();
         
         // Update task states for processes that are no longer running
         let mut changed = false;
@@ -432,6 +438,12 @@ impl TaskManager {
             if task.status == TaskStatus::Running {
                 if let Some(pid) = task.pid {
                     if !self.process_manager.is_process_running(pid) {
+                        // Check if we have an exit code for this task
+                        if let Some(&exit_code) = exit_codes.get(&task.id) {
+                            task.set_exit_code(Some(exit_code));
+                            println!("ℹ️  Task '{}' exited with code {}", task.name, exit_code);
+                        }
+                        
                         task.set_status(TaskStatus::Failed);
                         task.clear_pid();
                         changed = true;
