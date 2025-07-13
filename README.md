@@ -40,7 +40,7 @@ A command-line service manager for running and managing binary files on Linux an
 hyperV new --name "my-service" --binary "/path/to/binary"
 
 # Task with arguments
-hyperV new --name "web-server" --binary "/usr/bin/python3" --args "server.py" --args "--port=8080"
+hyperV new --name "web-server" --binary "/usr/bin/python3" --args "server.py" "--port=8080"
 
 # Task with environment variables
 hyperV new --name "api-service" --binary "/path/to/api" --env "PORT=3000" --env "NODE_ENV=production"

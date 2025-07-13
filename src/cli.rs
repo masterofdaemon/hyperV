@@ -23,7 +23,7 @@ pub enum Commands {
         #[arg(short, long)]
         binary: String,
         /// Arguments for the binary
-        #[arg(short, long)]
+        #[arg(short, long, num_args = 1..)]
         args: Vec<String>,
         /// Environment variables (format: KEY=VALUE)
         #[arg(short, long)]
