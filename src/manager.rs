@@ -71,13 +71,30 @@ impl TaskManager {
             return Err(HyperVError::TaskExists(name));
         }
 
-        // Parse environment variables
+        // Parse environment variables from command line
         let mut env = HashMap::new();
         for env_var in env_vars {
             if let Some((key, value)) = env_var.split_once('=') {
                 env.insert(key.to_string(), value.to_string());
             } else {
                 return Err(HyperVError::InvalidEnvVar(env_var));
+            }
+        }
+
+        // Load environment variables from .env file in workdir
+        if let Some(ref workdir) = workdir {
+            let env_file_path = std::path::Path::new(workdir).join(".env");
+            if env_file_path.exists() {
+                if let Ok(lines) = std::fs::read_to_string(&env_file_path) {
+                    for line in lines.lines() {
+                        if let Some((key, value)) = line.split_once('=') {
+                            // Command-line env vars take precedence
+                            if !env.contains_key(key) {
+                                env.insert(key.to_string(), value.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -153,8 +170,8 @@ impl TaskManager {
     /// Start a task
     pub fn start_task(&mut self, identifier: &str) -> Result<()> {
         let task = self.find_task(identifier)
-            .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?
-            .clone();
+            .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?.clone();
+
 
         // Check if task is already running
         if task.status == TaskStatus::Running {
@@ -187,7 +204,7 @@ impl TaskManager {
         LogManager::rotate_log_if_needed(&stdout_path)?;
         LogManager::rotate_log_if_needed(&stderr_path)?;
 
-        println!("🚀 Starting task '{}' with binary: {}", task.name, task.binary);
+        println!("🚀 Starting task \"{}\" with binary: {}", task.name, task.binary);
         if !task.args.is_empty() {
             println!("   Arguments: {:?}", task.args);
         }
@@ -198,8 +215,26 @@ impl TaskManager {
             println!("   Working directory: {}", workdir);
         }
 
+        // Clone the task's env and load from .env file
+        let mut task_env = task.env.clone();
+        if let Some(ref workdir) = task.workdir {
+            let env_file_path = std::path::Path::new(workdir).join(".env");
+            if env_file_path.exists() {
+                if let Ok(lines) = std::fs::read_to_string(&env_file_path) {
+                    for line in lines.lines() {
+                        if let Some((key, value)) = line.split_once('=') {
+                            // Task-specific env vars take precedence
+                            if !task_env.contains_key(key) {
+                                task_env.insert(key.to_string(), value.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Start the process
-        match self.process_manager.start_task(&task, &stdout_path, &stderr_path) {
+        match self.process_manager.start_task(&task, &task_env, &stdout_path, &stderr_path) {
             Ok(pid) => {
                 // Update task state
                 if let Some(task_mut) = self.find_task_mut(identifier) {
@@ -209,7 +244,7 @@ impl TaskManager {
                 }
 
                 self.save()?;
-                println!("✅ Task '{}' started successfully with PID {}", task.name, pid);
+                println!("✅ Task \"{}\" started successfully with PID {}", task.name, pid);
                 Ok(())
             }
             Err(e) => {
@@ -226,8 +261,8 @@ impl TaskManager {
     /// Stop a task
     pub fn stop_task(&mut self, identifier: &str) -> Result<()> {
         let task = self.find_task(identifier)
-            .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?
-            .clone();
+            .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?.clone();
+
 
         let task_name = task.name.clone();
         let task_id = task.id.clone();
@@ -237,22 +272,22 @@ impl TaskManager {
             if let Some(pid) = task.pid {
                 if !self.process_manager.is_process_running(pid) {
                     // Process is already dead, just update the status
-                    println!("ℹ️  Process {} for task '{}' has already terminated", pid, task_name);
+                    println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
                     if let Some(task_mut) = self.find_task_mut(identifier) {
                         task_mut.set_status(TaskStatus::Stopped);
                         task_mut.clear_pid();
                     }
                     self.save()?;
-                    println!("✅ Task '{}' status updated to stopped", task_name);
+                    println!("✅ Task \"{}\" status updated to stopped", task_name);
                     return Ok(());
                 }
                 
                 // Process is still running, try to stop it
-                println!("🛑 Stopping task '{}' (PID: {})...", task_name, pid);
+                println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
                 self.process_manager.stop_task(&task_id, pid)?;
             }
         } else {
-            println!("ℹ️  Task '{}' is already stopped", task_name);
+            println!("ℹ️  Task \"{}\" is already stopped", task_name);
             return Ok(());
         }
 
@@ -263,7 +298,7 @@ impl TaskManager {
         }
 
         self.save()?;
-        println!("✅ Task '{}' stopped", task_name);
+        println!("✅ Task \"{}\" stopped", task_name);
         Ok(())
     }
 
@@ -285,7 +320,7 @@ impl TaskManager {
         self.tasks.remove(task_index);
         self.save()?;
         
-        println!("✅ Task '{}' removed", task_name);
+        println!("✅ Task \"{}\" removed", task_name);
         Ok(())
     }
 
@@ -296,7 +331,7 @@ impl TaskManager {
                 if let Some(task) = self.find_task(id) {
                     task.print_details();
                 } else {
-                    println!("❌ Task '{}' not found", id);
+                    println!("❌ Task \"{}\" not found", id);
                 }
             }
             None => {
@@ -335,13 +370,14 @@ impl TaskManager {
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         println!("🔍 Diagnosing task: {}", task.name);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("---------------------------------------------------");
         
         // Diagnose the binary
         diagnose_binary(&task.binary)?;
 
         // Show task configuration
-        println!("\n⚙️  Task Configuration:");
+        println!("
+⚙️  Task Configuration:");
         task.print_details();
 
         Ok(())
@@ -374,14 +410,14 @@ impl TaskManager {
                 std::thread::sleep(RESTART_DELAY);
                 
                 if let Err(e) = self.start_task(&task_name) {
-                    println!("❌ Failed to auto-restart task '{}': {}", task_name, e);
+                    println!("❌ Failed to auto-restart task \"{}\": {}", task_name, e);
                     // Mark as failed again if restart fails
                     if let Some(task_mut) = self.find_task_mut(&task_name) {
                         task_mut.set_status(TaskStatus::Failed);
                     }
                     self.save()?;
                 } else {
-                    println!("✅ Task '{}' restarted successfully", task_name);
+                    println!("✅ Task \"{}\" restarted successfully", task_name);
                 }
             }
         }
@@ -441,7 +477,7 @@ impl TaskManager {
                         // Check if we have an exit code for this task
                         if let Some(&exit_code) = exit_codes.get(&task.id) {
                             task.set_exit_code(Some(exit_code));
-                            println!("ℹ️  Task '{}' exited with code {}", task.name, exit_code);
+                            println!("ℹ️  Task \"{}\" exited with code {}", task.name, exit_code);
                         }
                         
                         task.set_status(TaskStatus::Failed);

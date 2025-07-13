@@ -44,7 +44,7 @@ impl ProcessManager {
     }
 
     /// Start a task process
-    pub fn start_task(&mut self, task: &Task, stdout_log: &Path, stderr_log: &Path) -> Result<u32> {
+    pub fn start_task(&mut self, task: &Task, task_env: &HashMap<String, String>, stdout_log: &Path, stderr_log: &Path) -> Result<u32> {
         // Validate the binary before starting
         self.validate_binary(&task.binary)?;
 
@@ -53,7 +53,7 @@ impl ProcessManager {
         cmd.args(&task.args);
         
         // Set environment variables
-        for (key, value) in &task.env {
+        for (key, value) in task_env {
             cmd.env(key, value);
         }
         

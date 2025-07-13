@@ -7,6 +7,7 @@ A command-line service manager for running and managing binary files on Linux an
 - ✅ Create and manage tasks/services
 - ✅ Start/stop services with graceful shutdown
 - ✅ Environment variable support
+- ✅ **Automatic .env file loading**
 - ✅ Custom working directories
 - ✅ Auto-restart configuration
 - ✅ Task status monitoring with detailed information
@@ -47,6 +48,29 @@ hyperV new --name "api-service" --binary "/path/to/api" --env "PORT=3000" --env 
 # Task with working directory and auto-restart
 hyperV new --name "worker" --binary "/path/to/worker" --workdir "/opt/app" --auto-restart
 ```
+
+### Using .env files
+
+If a `.env` file exists in the specified working directory (`--workdir`), it will be automatically loaded. Environment variables passed via the `--env` flag will take precedence over the variables in the `.env` file.
+
+**Example `.env` file:**
+
+```
+DB_HOST=localhost
+DB_USER=myuser
+DB_PASS=secret
+```
+
+**Creating a task with a `.env` file:**
+
+```bash
+hyperV new --name "my-app" \
+  --binary "/path/to/app" \
+  --workdir "/path/to/my-app-folder" \
+  --auto-restart
+```
+
+If `/path/to/my-app-folder` contains a `.env` file, the variables within it will be loaded when the `my-app` service is started.
 
 ### List all tasks
 
