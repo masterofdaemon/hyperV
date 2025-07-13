@@ -22,9 +22,6 @@ pub enum Commands {
         /// Path to the binary file
         #[arg(short, long)]
         binary: String,
-        /// Arguments for the binary
-        #[arg(short, long, num_args = 1.., allow_hyphen_values = true)]
-        args: Vec<String>,
         /// Environment variables (format: KEY=VALUE)
         #[arg(short, long)]
         env: Vec<String>,
@@ -34,6 +31,9 @@ pub enum Commands {
         /// Auto-restart on failure
         #[arg(long)]
         auto_restart: bool,
+        /// Arguments for the binary (must be the last option)
+        #[arg(short, long, num_args = 1.., allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// List all tasks
     List,
