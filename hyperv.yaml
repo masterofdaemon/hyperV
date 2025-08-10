@@ -1,0 +1,16 @@
+services:
+  logger:
+    binary: "/bin/bash"
+    args: ["./tests/logger.sh"]
+    workdir: "/Users/masutanoakira/projs/hyperV"
+    auto_restart: true
+  worker:
+    binary: "/bin/bash"
+    args: ["./tests/worker.sh"]
+    workdir: "/Users/masutanoakira/projs/hyperV"
+    auto_restart: false
+  crasher:
+    binary: "/bin/bash"
+    args: ["./tests/crasher.sh"]
+    workdir: "/Users/masutanoakira/projs/hyperV"
+    auto_restart: true 

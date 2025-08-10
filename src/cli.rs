@@ -78,5 +78,20 @@ pub enum Commands {
     },
     /// Run in daemon mode (monitor and auto-restart tasks)
     Daemon,
+    /// Apply services from a compose YAML file (create/update tasks)
+    Up {
+        /// Path to compose YAML file
+        #[arg(short, long, default_value = "hyperv.yaml")]
+        file: String,
+        /// Start services after applying
+        #[arg(long)]
+        start: bool,
+    },
+    /// Remove services defined in a compose YAML file
+    Down {
+        /// Path to compose YAML file
+        #[arg(short, long, default_value = "hyperv.yaml")]
+        file: String,
+    },
 }
 

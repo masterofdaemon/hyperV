@@ -32,7 +32,18 @@ impl ProcessManager {
         #[cfg(unix)]
         {
             use libc::kill;
-            unsafe { kill(pid as i32, 0) == 0 }
+            let result = unsafe { kill(pid as i32, 0) };
+            if result == 0 {
+                return true;
+            }
+            // If kill returns an error with EPERM, the process exists but we lack permissions
+            let errno_opt = std::io::Error::last_os_error().raw_os_error();
+            if let Some(errno) = errno_opt {
+                if errno == libc::EPERM {
+                    return true;
+                }
+            }
+            false
         }
         
         #[cfg(not(unix))]

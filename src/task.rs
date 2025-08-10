@@ -44,6 +44,8 @@ pub struct Task {
     pub last_started: Option<String>,
     pub restart_count: u32,
     pub last_exit_code: Option<i32>,
+    #[serde(default)]
+    pub suppress_restart: bool,
 }
 
 impl Task {
@@ -75,6 +77,7 @@ impl Task {
             last_started: None,
             restart_count: 0,
             last_exit_code: None,
+            suppress_restart: false,
         }
     }
 
@@ -96,6 +99,11 @@ impl Task {
     /// Set last started timestamp to now
     pub fn set_last_started(&mut self) {
         self.last_started = Some(chrono::Utc::now().to_rfc3339());
+    }
+
+    /// Clear the suppress-restart flag (used for explicit user starts)
+    pub fn clear_suppress_restart(&mut self) {
+        self.suppress_restart = false;
     }
 
     /// Increment restart count

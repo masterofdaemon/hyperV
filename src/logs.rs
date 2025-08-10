@@ -136,7 +136,9 @@ impl LogManager {
                 println!("{}", line);
             }
         } else {
-            println!("Log file not found: {}", log_path.display());
+            println!("No {} logs yet. Start the service to generate logs.", log_name);
+            println!("Path: {}", log_path.display());
+            return Ok(());
         }
 
         if follow {

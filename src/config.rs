@@ -61,6 +61,11 @@ impl Config {
             .map_err(|e| HyperVError::Io(e))?;
         Ok(())
     }
+
+    /// Path to daemon PID file
+    pub fn daemon_pid_path(&self) -> PathBuf {
+        self.config_dir.join("daemon.pid")
+    }
 }
 
 impl Default for Config {

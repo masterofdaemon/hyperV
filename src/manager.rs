@@ -12,6 +12,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use uuid::Uuid;
+use sysinfo::{System, Pid};
 
 /// Main task manager that coordinates all operations
 pub struct TaskManager {
@@ -24,6 +25,16 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    fn get_process_memory_mb(sys: &mut System, pid: u32) -> u64 {
+        let pid = Pid::from_u32(pid);
+        if let Some(proc_) = sys.process(pid) {
+            // memory() typically returns KiB in sysinfo 0.30
+            let kib = proc_.memory();
+            return (kib / 1024) as u64; // MB
+        }
+        0
+    }
+
     /// Create a new task manager
     pub fn new() -> Result<Self> {
         let config = Config::new()?;
@@ -32,8 +43,17 @@ impl TaskManager {
         let tasks = if config.tasks_file.exists() {
             let content = fs::read_to_string(&config.tasks_file)
                 .map_err(HyperVError::Io)?;
-            serde_json::from_str(&content)
-                .unwrap_or_else(|_| Vec::new())
+            match serde_json::from_str(&content) {
+                Ok(tasks) => tasks,
+                Err(err) => {
+                    eprintln!("⚠️  Failed to parse tasks file: {}", err);
+                    // Backup the corrupted file for user inspection
+                    let backup_path = config.tasks_file.with_extension("json.bak");
+                    let _ = fs::copy(&config.tasks_file, &backup_path);
+                    eprintln!("📦 Backed up corrupted tasks file to {}", backup_path.display());
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -46,12 +66,21 @@ impl TaskManager {
     }
 
     /// Save tasks to configuration file
-    fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
         
-        fs::write(&self.config.tasks_file, json)
-            .map_err(HyperVError::Io)?;
+        // Write atomically: write to temp file then rename over the original.
+        let tmp_path = self.config.tasks_file.with_extension("json.tmp");
+        fs::write(&tmp_path, json.as_bytes()).map_err(HyperVError::Io)?;
+
+        // Backup previous file if exists
+        if self.config.tasks_file.exists() {
+            let backup_path = self.config.tasks_file.with_extension("json.prev");
+            let _ = fs::copy(&self.config.tasks_file, &backup_path);
+        }
+
+        fs::rename(&tmp_path, &self.config.tasks_file).map_err(HyperVError::Io)?;
         
         Ok(())
     }
@@ -134,23 +163,37 @@ impl TaskManager {
             return;
         }
 
-        println!("{:<36} {:<20} {:<15} {:<30}", "ID", "NAME", "STATUS", "BINARY");
-        println!("{}", "-".repeat(100));
-        
+        println!("{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}", "ID", "NAME", "STATUS", "MEM(MB)", "STARTED", "BINARY");
+        println!("{}", "-".repeat(140));
+
+        let mut sys = System::new();
+        sys.refresh_processes();
+
         for task in &self.tasks {
             let status_display = task.status.display_with_icon();
+            // Memory usage in MB if running
+            let mem_mb = if let (TaskStatus::Running, Some(pid)) = (&task.status, task.pid) {
+                Self::get_process_memory_mb(&mut sys, pid)
+            } else { 0 };
+
+            let started = task
+                .last_started
+                .as_deref()
+                .unwrap_or("-");
             println!(
-                "{:<36} {:<20} {:<15} {:<30}",
+                "{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}",
                 &task.id[..8],
                 task.name,
                 status_display,
+                mem_mb,
+                started,
                 task.binary
             );
         }
     }
 
     /// Find a task by identifier (name, ID, or partial ID)
-    fn find_task(&self, identifier: &str) -> Option<&Task> {
+    pub(crate) fn find_task(&self, identifier: &str) -> Option<&Task> {
         self.tasks.iter().find(|t| 
             t.name == identifier || 
             t.id == identifier || 
@@ -159,7 +202,7 @@ impl TaskManager {
     }
 
     /// Find a mutable task by identifier
-    fn find_task_mut(&mut self, identifier: &str) -> Option<&mut Task> {
+    pub(crate) fn find_task_mut(&mut self, identifier: &str) -> Option<&mut Task> {
         self.tasks.iter_mut().find(|t| 
             t.name == identifier || 
             t.id == identifier || 
@@ -241,6 +284,7 @@ impl TaskManager {
                     task_mut.set_status(TaskStatus::Running);
                     task_mut.set_pid(Some(pid));
                     task_mut.set_last_started();
+                    task_mut.clear_suppress_restart();
                 }
 
                 self.save()?;
@@ -267,6 +311,13 @@ impl TaskManager {
         let task_name = task.name.clone();
         let task_id = task.id.clone();
 
+        // Mark as stopped and suppress restart before attempting to kill to avoid race with daemon
+        if let Some(task_mut) = self.find_task_mut(identifier) {
+            task_mut.set_status(TaskStatus::Stopped);
+            task_mut.suppress_restart = true;
+        }
+        self.save()?;
+
         // Check if task is marked as running but process doesn't exist
         if task.status == TaskStatus::Running {
             if let Some(pid) = task.pid {
@@ -274,7 +325,6 @@ impl TaskManager {
                     // Process is already dead, just update the status
                     println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
                     if let Some(task_mut) = self.find_task_mut(identifier) {
-                        task_mut.set_status(TaskStatus::Stopped);
                         task_mut.clear_pid();
                     }
                     self.save()?;
@@ -293,7 +343,6 @@ impl TaskManager {
 
         // Update task state
         if let Some(task_mut) = self.find_task_mut(identifier) {
-            task_mut.set_status(TaskStatus::Stopped);
             task_mut.clear_pid();
         }
 
@@ -386,11 +435,21 @@ impl TaskManager {
     /// Check and restart failed tasks with auto-restart enabled
     pub fn check_and_restart_tasks(&mut self) -> Result<()> {
         use crate::constants::{MAX_RESTART_ATTEMPTS, RESTART_DELAY};
-        
+ 
+        // Reload tasks from disk to pick up external changes (like suppression on stop)
+        if self.config.tasks_file.exists() {
+            if let Ok(content) = fs::read_to_string(&self.config.tasks_file) {
+                if let Ok(tasks_on_disk) = serde_json::from_str::<Vec<Task>>(&content) {
+                    self.tasks = tasks_on_disk;
+                }
+            }
+        }
+
         let tasks_to_restart: Vec<String> = self.tasks
             .iter()
             .filter(|task| {
-                task.auto_restart && 
+                task.auto_restart &&
+                !task.suppress_restart &&
                 task.status == TaskStatus::Failed && 
                 task.restart_count <= MAX_RESTART_ATTEMPTS
             })
@@ -434,7 +493,7 @@ impl TaskManager {
                 if let Some(pid) = task.pid {
                     if !self.process_manager.is_process_running(pid) {
                         // Process has terminated, update status
-                        task.set_status(TaskStatus::Stopped);
+                        task.set_status(TaskStatus::Failed);
                         task.clear_pid();
                         updated = true;
                     }
@@ -466,6 +525,15 @@ impl TaskManager {
 
     /// Clean up zombie processes and update task states
     pub fn cleanup(&mut self) -> Result<()> {
+        // Reload tasks from disk to incorporate external updates (e.g., stop suppression)
+        if self.config.tasks_file.exists() {
+            if let Ok(content) = fs::read_to_string(&self.config.tasks_file) {
+                if let Ok(tasks_on_disk) = serde_json::from_str::<Vec<Task>>(&content) {
+                    self.tasks = tasks_on_disk;
+                }
+            }
+        }
+
         let exit_codes = self.process_manager.cleanup_zombies();
         
         // Update task states for processes that are no longer running
@@ -493,6 +561,11 @@ impl TaskManager {
         }
         
         Ok(())
+    }
+
+    /// Whether any task has auto-restart enabled
+    pub fn any_autorestart_enabled(&self) -> bool {
+        self.tasks.iter().any(|t| t.auto_restart)
     }
 }
 
