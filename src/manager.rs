@@ -8,11 +8,18 @@ use crate::error::{HyperVError, Result};
 use crate::logs::{LogManager, LogType};
 use crate::process::{ProcessManager, diagnose_binary};
 use crate::task::{Task, TaskStatus};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use uuid::Uuid;
 use sysinfo::{System, Pid};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct RunningTask {
+    task_id: String,
+    pid: u32,
+}
 
 /// Main task manager that coordinates all operations
 pub struct TaskManager {
@@ -40,7 +47,7 @@ impl TaskManager {
         let config = Config::new()?;
         
         // Load existing tasks
-        let tasks = if config.tasks_file.exists() {
+        let mut tasks: Vec<Task> = if config.tasks_file.exists() {
             let content = fs::read_to_string(&config.tasks_file)
                 .map_err(HyperVError::Io)?;
             match serde_json::from_str(&content) {
@@ -58,10 +65,26 @@ impl TaskManager {
             Vec::new()
         };
 
+        let process_manager = ProcessManager::new();
+        if config.running_tasks_file.exists() {
+            let content = fs::read_to_string(&config.running_tasks_file)
+                .map_err(HyperVError::Io)?;
+            if let Ok(running_tasks) = serde_json::from_str::<Vec<RunningTask>>(&content) {
+                for running_task in running_tasks {
+                    if process_manager.is_process_running(running_task.pid) {
+                        if let Some(task) = tasks.iter_mut().find(|t| t.id == running_task.task_id) {
+                            task.set_status(TaskStatus::Running);
+                            task.set_pid(Some(running_task.pid));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             tasks,
             config,
-            process_manager: ProcessManager::new(),
+            process_manager,
         })
     }
 
@@ -82,6 +105,24 @@ impl TaskManager {
 
         fs::rename(&tmp_path, &self.config.tasks_file).map_err(HyperVError::Io)?;
         
+        Ok(())
+    }
+
+    fn save_running_tasks(&self) -> Result<()> {
+        let running_tasks: Vec<RunningTask> = self.tasks.iter()
+            .filter(|t| t.status == TaskStatus::Running && t.pid.is_some())
+            .map(|t| RunningTask {
+                task_id: t.id.clone(),
+                pid: t.pid.unwrap(),
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&running_tasks)
+            .map_err(|e| HyperVError::Serialization(e.to_string()))?;
+
+        fs::write(&self.config.running_tasks_file, json.as_bytes())
+            .map_err(HyperVError::Io)?;
+
         Ok(())
     }
 
@@ -288,6 +329,7 @@ impl TaskManager {
                 }
 
                 self.save()?;
+                self.save_running_tasks()?;
                 println!("✅ Task \"{}\" started successfully with PID {}", task.name, pid);
                 Ok(())
             }
@@ -304,49 +346,34 @@ impl TaskManager {
 
     /// Stop a task
     pub fn stop_task(&mut self, identifier: &str) -> Result<()> {
-        let task = self.find_task(identifier)
-            .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?.clone();
+        let (task_name, task_id, pid) = {
+            let task = self.find_task(identifier)
+                .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
+            if task.status != TaskStatus::Running {
+                println!("ℹ️  Task \"{}\" is already stopped", task.name);
+                return Ok(());
+            }
+            (task.name.clone(), task.id.clone(), task.pid)
+        };
 
-        let task_name = task.name.clone();
-        let task_id = task.id.clone();
-
-        // Mark as stopped and suppress restart before attempting to kill to avoid race with daemon
-        if let Some(task_mut) = self.find_task_mut(identifier) {
-            task_mut.set_status(TaskStatus::Stopped);
-            task_mut.suppress_restart = true;
-        }
-        self.save()?;
-
-        // Check if task is marked as running but process doesn't exist
-        if task.status == TaskStatus::Running {
-            if let Some(pid) = task.pid {
-                if !self.process_manager.is_process_running(pid) {
-                    // Process is already dead, just update the status
-                    println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
-                    if let Some(task_mut) = self.find_task_mut(identifier) {
-                        task_mut.clear_pid();
-                    }
-                    self.save()?;
-                    println!("✅ Task \"{}\" status updated to stopped", task_name);
-                    return Ok(());
-                }
-                
-                // Process is still running, try to stop it
+        if let Some(pid) = pid {
+            if !self.process_manager.is_process_running(pid) {
+                println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
+            } else {
                 println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
                 self.process_manager.stop_task(&task_id, pid)?;
             }
-        } else {
-            println!("ℹ️  Task \"{}\" is already stopped", task_name);
-            return Ok(());
         }
 
-        // Update task state
-        if let Some(task_mut) = self.find_task_mut(identifier) {
-            task_mut.clear_pid();
+        if let Some(task) = self.find_task_mut(identifier) {
+            task.set_status(TaskStatus::Stopped);
+            task.suppress_restart = true;
+            task.clear_pid();
         }
 
         self.save()?;
+        self.save_running_tasks()?;
         println!("✅ Task \"{}\" stopped", task_name);
         Ok(())
     }
@@ -368,6 +395,7 @@ impl TaskManager {
         let task_name = self.tasks[task_index].name.clone();
         self.tasks.remove(task_index);
         self.save()?;
+        self.save_running_tasks()?;
         
         println!("✅ Task \"{}\" removed", task_name);
         Ok(())
@@ -503,6 +531,7 @@ impl TaskManager {
         
         if updated {
             self.save()?;
+            self.save_running_tasks()?;
         }
         
         Ok(())
@@ -558,6 +587,7 @@ impl TaskManager {
         
         if changed {
             self.save()?;
+            self.save_running_tasks()?;
         }
         
         Ok(())

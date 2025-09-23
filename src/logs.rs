@@ -5,7 +5,7 @@
 use crate::constants::{MAX_LOG_SIZE, LOG_FOLLOW_INTERVAL};
 use crate::error::{HyperVError, Result};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::thread;
 
@@ -69,22 +69,49 @@ impl LogManager {
             return Ok(vec!["Log file not found or empty".to_string()]);
         }
 
-        let file = File::open(log_path)
-            .map_err(HyperVError::Io)?;
-        
-        let reader = BufReader::new(file);
-        let all_lines: Vec<String> = reader
-            .lines()
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(HyperVError::Io)?;
+        let file = File::open(log_path).map_err(HyperVError::Io)?;
+        let file_size = file.metadata().map_err(HyperVError::Io)?.len();
+        let mut reader = BufReader::new(file);
 
-        let start_index = if all_lines.len() > lines {
-            all_lines.len() - lines
-        } else {
-            0
-        };
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
 
-        Ok(all_lines[start_index..].to_vec())
+        let mut result_lines = Vec::new();
+        let mut buffer = Vec::new();
+        let mut current_pos = file_size;
+
+        // Read the file from the end in chunks
+        while current_pos > 0 && result_lines.len() < lines {
+            let chunk_size = std::cmp::min(current_pos, 4096);
+            current_pos -= chunk_size;
+            reader.seek(SeekFrom::Start(current_pos)).map_err(HyperVError::Io)?;
+            let mut chunk = vec![0; chunk_size as usize];
+            reader.read_exact(&mut chunk).map_err(HyperVError::Io)?;
+
+            // Prepend the chunk to our buffer
+            buffer.splice(0..0, chunk.iter().cloned());
+
+            // Process the buffer to find lines
+            while let Some(newline_pos) = buffer.iter().rposition(|&b| b == b'\n') {
+                let line_bytes = buffer.split_off(newline_pos + 1);
+                if !line_bytes.is_empty() {
+                    result_lines.push(String::from_utf8_lossy(&line_bytes).trim_end().to_string());
+                    if result_lines.len() >= lines {
+                        break;
+                    }
+                }
+                buffer.pop(); // Remove the newline character
+            }
+        }
+
+        // Add the remaining buffer as the first line
+        if !buffer.is_empty() && result_lines.len() < lines {
+            result_lines.push(String::from_utf8_lossy(&buffer).trim_end().to_string());
+        }
+
+        result_lines.reverse();
+        Ok(result_lines)
     }
 
     /// Show logs for a task

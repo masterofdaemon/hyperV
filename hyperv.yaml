@@ -13,4 +13,17 @@ services:
     binary: "/bin/bash"
     args: ["./tests/crasher.sh"]
     workdir: "/Users/masutanoakira/projs/hyperV"
-    auto_restart: true 
+    auto_restart: true
+  surrealdb:
+    binary: "/bin/bash"
+    args:
+      - "-lc"
+      - "surreal start --bind $SURREAL_HOST:$SURREAL_PORT rocksdb:$SURREAL_STORAGE_PATH --log $SURREAL_LOG_LEVEL --user $SURREAL_USER --password $SURREAL_PASSWORD"
+    env:
+      SURREAL_HOST: "0.0.0.0"
+      SURREAL_PORT: "8000"
+      SURREAL_STORAGE_PATH: "/tmp/surreal_data"
+      SURREAL_LOG_LEVEL: "info"
+      SURREAL_USER: "root"
+      SURREAL_PASSWORD: "secret"
+    auto_restart: true

@@ -14,6 +14,7 @@ A command-line service manager for running and managing binary files on Linux an
 - ✅ Cross-platform support (Linux & macOS)
 - ✅ Persistent task configuration
 - ✅ Process monitoring with PID tracking
+- ✅ Memory usage in list view (per-process MB)
 - ✅ Log management with rotation (>10MB)
 - ✅ Real-time log following (--follow flag)
 - ✅ Separate stdout/stderr log viewing
@@ -21,6 +22,7 @@ A command-line service manager for running and managing binary files on Linux an
 - ✅ Diagnostic tools for troubleshooting
 - ✅ Exit code tracking
 - ✅ Restart count monitoring
+- ✅ Persistent running-task state across hyperV restarts
 
 ## Installation
 
@@ -150,6 +152,7 @@ hyperV new --name "critical-service" --binary "/path/to/service" --auto-restart
 - Logs are automatically rotated when they exceed 10MB
 - Separate stdout and stderr log files
 - Real-time log following capability
+- Fast last-N reading for tail-like views (reads from end of file efficiently)
 - Historical log preservation (.old files)
 
 ### Process Management
@@ -165,6 +168,14 @@ The status command now shows:
 - Last exit code
 - Detailed process information
 
+### Runtime State Persistence
+hyperV persists the set of running tasks to a small JSON file (running_tasks.json) under the configuration directory. On startup:
+- It reads this file and checks each recorded PID to see if the process is still alive.
+- Tasks whose PIDs are still running are marked as Running and their PID is restored.
+- Stale entries (where the PID is no longer alive) are ignored.
+
+This file is automatically updated when tasks start/stop and when the manager detects that a process has exited. You generally do not need to edit it manually.
+
 ## Configuration
 
 Tasks are stored in JSON format at:
@@ -174,6 +185,10 @@ Tasks are stored in JSON format at:
 Logs are stored in:
 - macOS: `~/Library/Application Support/hyperV/logs/<task-id>/`
 - Linux: `~/.config/hyperV/logs/<task-id>/`
+
+Runtime state (persisted running tasks) is stored in:
+- macOS: `~/Library/Application Support/hyperV/running_tasks.json`
+- Linux: `~/.config/hyperV/running_tasks.json`
 
 ## Task Structure
 
@@ -234,6 +249,81 @@ hyperV new --name "my-daemon" \
 
 hyperV start my-daemon
 ```
+
+### Running SurrealDB
+
+A helper script is provided to launch SurrealDB using environment variables: `tests/surreal.sh`.
+
+Create a task that runs the script via bash:
+
+```bash
+hyperV new --name "surrealdb" \
+  --binary "/bin/bash" \
+  --args "./tests/surreal.sh" \
+  --workdir "/path/to/this/repo" \
+  --env "SURREAL_HOST=0.0.0.0" \
+  --env "SURREAL_PORT=8000" \
+  --env "SURREAL_STORAGE_PATH=/tmp/surreal_data" \
+  --env "SURREAL_LOG_LEVEL=info" \
+  --env "SURREAL_USER=root" \
+  --env "SURREAL_PASSWORD=secret" \
+  --auto-restart
+
+# Start the database
+hyperV start surrealdb
+
+# View logs
+hyperV logs surrealdb --follow
+```
+
+The script builds and executes the command:
+
+```bash
+SURREAL_CMD="surreal start --bind $SURREAL_HOST:$SURREAL_PORT rocksdb:$SURREAL_STORAGE_PATH --log $SURREAL_LOG_LEVEL --user $SURREAL_USER --password $SURREAL_PASSWORD"
+```
+
+Ensure the `surreal` binary is available in your PATH. Adjust environment variables as needed.
+
+### Running SurrealDB from hyperv.yaml (compose)
+
+You can also define and run SurrealDB purely from hyperv.yaml without a helper script. Example hyperv.yaml fragment:
+
+```yaml
+services:
+  surrealdb:
+    binary: "/bin/bash"
+    args:
+      - "-lc"
+      - "surreal start --bind $SURREAL_HOST:$SURREAL_PORT rocksdb:$SURREAL_STORAGE_PATH --log $SURREAL_LOG_LEVEL --user $SURREAL_USER --password $SURREAL_PASSWORD"
+    env:
+      SURREAL_HOST: "0.0.0.0"
+      SURREAL_PORT: "8000"
+      SURREAL_STORAGE_PATH: "/tmp/surreal_data"
+      SURREAL_LOG_LEVEL: "info"
+      SURREAL_USER: "root"
+      SURREAL_PASSWORD: "secret"
+    auto_restart: true
+```
+
+Then apply and start it with:
+
+```bash
+# create/update tasks from hyperv.yaml and start them
+hyperV up -f hyperv.yaml --start
+
+# inspect
+hyperV list
+hyperV logs surrealdb --follow
+
+# remove the services defined in hyperv.yaml
+hyperV down -f hyperv.yaml
+```
+
+Notes:
+- We use /bin/bash -lc so that environment variables in the command are expanded by the shell.
+- The env block in YAML sets those variables for the process; adjust as needed.
+- Ensure the surreal binary is available in PATH for the user running hyperV.
+- Alternatively, you can keep using the provided tests/surreal.sh wrapper if you prefer.
 
 ## Future Enhancements
 

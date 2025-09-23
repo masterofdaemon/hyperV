@@ -12,6 +12,8 @@ pub struct Config {
     pub config_dir: PathBuf,
     /// Path to tasks configuration file
     pub tasks_file: PathBuf,
+    /// Path to running tasks file
+    pub running_tasks_file: PathBuf,
     /// Directory for log files
     pub logs_dir: PathBuf,
 }
@@ -24,6 +26,7 @@ impl Config {
             .join("hyperV");
 
         let tasks_file = config_dir.join("tasks.json");
+        let running_tasks_file = config_dir.join("running_tasks.json");
         let logs_dir = config_dir.join("logs");
 
         // Create directories if they don't exist
@@ -35,6 +38,7 @@ impl Config {
         Ok(Config {
             config_dir,
             tasks_file,
+            running_tasks_file,
             logs_dir,
         })
     }
