@@ -35,9 +35,9 @@ impl TaskManager {
     fn get_process_memory_mb(sys: &mut System, pid: u32) -> u64 {
         let pid = Pid::from_u32(pid);
         if let Some(proc_) = sys.process(pid) {
-            // memory() typically returns KiB in sysinfo 0.30
-            let kib = proc_.memory();
-            return (kib / 1024) as u64; // MB
+            // memory() returns bytes in sysinfo 0.30
+            let bytes = proc_.memory();
+            return (bytes / (1024 * 1024)) as u64; // Convert bytes to MB
         }
         0
     }
