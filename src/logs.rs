@@ -232,11 +232,8 @@ impl LogManager {
     }
 
     /// Follow both stdout and stderr logs in real-time
+    /// Follow both stdout and stderr logs in real-time
     fn follow_both_logs(stdout_path: &Path, stderr_path: &Path) -> Result<()> {
-        // This is a simplified implementation
-        // In a production system, you might want to use async I/O or threads
-        // to properly interleave stdout and stderr output
-        
         let mut stdout_file = if stdout_path.exists() {
             let mut f = File::open(stdout_path).map_err(HyperVError::Io)?;
             f.seek(SeekFrom::End(0)).map_err(HyperVError::Io)?;
@@ -256,6 +253,10 @@ impl LogManager {
         let mut stdout_line = String::new();
         let mut stderr_line = String::new();
 
+        println!("📖 Following logs (Press Ctrl+C to stop)");
+        println!("OUT: {}", stdout_path.display());
+        println!("ERR: {}", stderr_path.display());
+
         loop {
             let mut has_output = false;
 
@@ -267,8 +268,28 @@ impl LogManager {
                         print!("[OUT] {}", stdout_line);
                         has_output = true;
                     }
-                    _ => {}
+                    Ok(_) => {
+                        // Check rotation
+                        if let Ok(new_file) = File::open(stdout_path) {
+                            if let Ok(new_meta) = new_file.metadata() {
+                                if let Ok(curr_meta) = reader.get_ref().metadata() {
+                                    if new_meta.len() < curr_meta.len() {
+                                        println!("🔄 Stdout log rotated, reopening...");
+                                        *reader = BufReader::new(new_file);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {}
                 }
+            } else if stdout_path.exists() {
+                // File appeared
+                 if let Ok(mut f) = File::open(stdout_path) {
+                    // Start from beginning or end? Tail usually starts from end if following, 
+                    // but if it just appeared we might want start. Let's start from beginning.
+                    stdout_file = Some(BufReader::new(f));
+                 }
             }
 
             // Check stderr
@@ -279,8 +300,26 @@ impl LogManager {
                         print!("[ERR] {}", stderr_line);
                         has_output = true;
                     }
-                    _ => {}
+                    Ok(_) => {
+                         // Check rotation
+                        if let Ok(new_file) = File::open(stderr_path) {
+                            if let Ok(new_meta) = new_file.metadata() {
+                                if let Ok(curr_meta) = reader.get_ref().metadata() {
+                                    if new_meta.len() < curr_meta.len() {
+                                        println!("🔄 Stderr log rotated, reopening...");
+                                        *reader = BufReader::new(new_file);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {}
                 }
+            } else if stderr_path.exists() {
+                // File appeared
+                 if let Ok(mut f) = File::open(stderr_path) {
+                    stderr_file = Some(BufReader::new(f));
+                 }
             }
 
             if !has_output {

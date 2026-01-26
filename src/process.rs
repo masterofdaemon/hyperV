@@ -29,29 +29,10 @@ impl ProcessManager {
 
     /// Check if a process with the given PID is running
     pub fn is_process_running(&self, pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            use libc::kill;
-            let result = unsafe { kill(pid as i32, 0) };
-            if result == 0 {
-                return true;
-            }
-            // If kill returns an error with EPERM, the process exists but we lack permissions
-            let errno_opt = std::io::Error::last_os_error().raw_os_error();
-            if let Some(errno) = errno_opt {
-                if errno == libc::EPERM {
-                    return true;
-                }
-            }
-            false
-        }
-        
-        #[cfg(not(unix))]
-        {
-            // On non-Unix systems, we can't easily check if a process is running
-            // This is a limitation for Windows support
-            false
-        }
+        use sysinfo::{System, Pid};
+        let mut system = System::new();
+        let pid = Pid::from_u32(pid);
+        system.refresh_process(pid)
     }
 
     /// Start a task process

@@ -1,0 +1,10 @@
+services:
+  AiTrainingApp.Api:
+    binary: "./AiTrainingApp.Api"
+    workdir: "/root/ai-training-app/backend/src/AiTrainingApp.Api/publish-linux"
+    env:
+      ASPNETCORE_URLS: "http://0.0.0.0:5000"
+      Gemini__ApiKey: "YOUR_GEMINI_API_KEY_HERE"
+      Logging__LogLevel__Default: "Debug"
+      Logging__Console__FormatterName: "Simple"
+    auto_restart: true

@@ -21,9 +21,13 @@ pub struct Config {
 impl Config {
     /// Initialize configuration directories and paths
     pub fn new() -> Result<Self> {
-        let config_dir = dirs::config_dir()
-            .ok_or(HyperVError::Config("Could not find config directory".to_string()))?
-            .join("hyperV");
+        let config_dir = if let Ok(val) = std::env::var("HYPERV_CONFIG_DIR") {
+            PathBuf::from(val)
+        } else {
+            dirs::config_dir()
+                .ok_or(HyperVError::Config("Could not find config directory".to_string()))?
+                .join("hyperV")
+        };
 
         let tasks_file = config_dir.join("tasks.json");
         let running_tasks_file = config_dir.join("running_tasks.json");
@@ -31,9 +35,9 @@ impl Config {
 
         // Create directories if they don't exist
         fs::create_dir_all(&config_dir)
-            .map_err(|e| HyperVError::Io(e))?;
+            .map_err(HyperVError::Io)?;
         fs::create_dir_all(&logs_dir)
-            .map_err(|e| HyperVError::Io(e))?;
+            .map_err(HyperVError::Io)?;
 
         Ok(Config {
             config_dir,
@@ -62,7 +66,7 @@ impl Config {
     pub fn ensure_task_log_dir(&self, task_id: &str) -> Result<()> {
         let dir = self.task_log_dir(task_id);
         fs::create_dir_all(&dir)
-            .map_err(|e| HyperVError::Io(e))?;
+            .map_err(HyperVError::Io)?;
         Ok(())
     }
 

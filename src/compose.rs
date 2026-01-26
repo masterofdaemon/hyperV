@@ -27,7 +27,7 @@ pub struct Service {
 impl ComposeFile {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(&path).map_err(HyperVError::Io)?;
-        let compose: ComposeFile = serde_yaml::from_str(&content)
+        let compose: ComposeFile = serde_yml::from_str(&content)
             .map_err(|e| HyperVError::InvalidInput(format!("Failed to parse YAML: {}", e)))?;
         Ok(compose)
     }

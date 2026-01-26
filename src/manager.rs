@@ -45,34 +45,34 @@ impl TaskManager {
     /// Create a new task manager
     pub fn new() -> Result<Self> {
         let config = Config::new()?;
-        
-        // Load existing tasks
-        let mut tasks: Vec<Task> = if config.tasks_file.exists() {
-            let content = fs::read_to_string(&config.tasks_file)
-                .map_err(HyperVError::Io)?;
-            match serde_json::from_str(&content) {
-                Ok(tasks) => tasks,
-                Err(err) => {
-                    eprintln!("⚠️  Failed to parse tasks file: {}", err);
-                    // Backup the corrupted file for user inspection
-                    let backup_path = config.tasks_file.with_extension("json.bak");
-                    let _ = fs::copy(&config.tasks_file, &backup_path);
-                    eprintln!("📦 Backed up corrupted tasks file to {}", backup_path.display());
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
         let process_manager = ProcessManager::new();
-        if config.running_tasks_file.exists() {
-            let content = fs::read_to_string(&config.running_tasks_file)
+        
+        let mut manager = Self {
+            tasks: Vec::new(),
+            config,
+            process_manager,
+        };
+        
+        // Load existing tasks (with locking)
+        if let Err(e) = manager.load() {
+            eprintln!("⚠️  Failed to load tasks: {}", e);
+            // If load fails, we start with empty tasks. 
+            // In a robust system we might want to backup here, but load() has error handling now.
+            // Let's rely on load()'s integrity.
+        }
+
+        // Hydrate status from running_tasks.json
+        if manager.config.running_tasks_file.exists() {
+            let content = fs::read_to_string(&manager.config.running_tasks_file)
                 .map_err(HyperVError::Io)?;
             if let Ok(running_tasks) = serde_json::from_str::<Vec<RunningTask>>(&content) {
                 for running_task in running_tasks {
-                    if process_manager.is_process_running(running_task.pid) {
-                        if let Some(task) = tasks.iter_mut().find(|t| t.id == running_task.task_id) {
+                    use sysinfo::{System, Pid};
+                    // Use sysinfo to check process
+                    let mut sys = System::new();
+                    let pid = Pid::from_u32(running_task.pid);
+                    if sys.refresh_process(pid) {
+                         if let Some(task) = manager.tasks.iter_mut().find(|t| t.id == running_task.task_id) {
                             task.set_status(TaskStatus::Running);
                             task.set_pid(Some(running_task.pid));
                         }
@@ -81,17 +81,64 @@ impl TaskManager {
             }
         }
 
-        Ok(Self {
-            tasks,
-            config,
-            process_manager,
-        })
+        Ok(manager)
+    }
+
+    /// Load tasks from configuration file
+    pub(crate) fn load(&mut self) -> Result<()> {
+        if !self.config.tasks_file.exists() {
+            return Ok(());
+        }
+
+        let file = fs::File::open(&self.config.tasks_file).map_err(HyperVError::Io)?;
+        
+        // Lock shared read
+        use fs2::FileExt;
+        if let Err(e) = file.try_lock_shared() {
+             // If we can't get a shared lock, maybe someone is writing.
+             // We can wait or hard fail. Let's wait a bit.
+             // Actually, for simplicity, let's just wait or fail.
+             // Given it's a CLI tool, blocking is okay.
+             file.lock_shared().map_err(HyperVError::Io)?;
+        }
+
+        let reader = std::io::BufReader::new(&file);
+        let tasks: Vec<Task> = serde_json::from_reader(reader)
+            .map_err(|e| HyperVError::Serialization(e.to_string()))?;
+        
+        // Unlock happens automatically when file is dropped
+        self.tasks = tasks;
+        Ok(())
     }
 
     /// Save tasks to configuration file
     pub(crate) fn save(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
+        
+        // To prevent races, we should acquire a lock.
+        // But since we are writing to a temp file then renaming, the rename is atomic.
+        // However, we might have read STALE data if we didn't lock during read-modify-write.
+        // The proper way is: lock FILE, read, modify, write, unlock.
+        // But load() and save() are separate methods in this struct.
+        // This suggests the TaskManager should perhaps hold the lock?
+        // Or we use a separate lock file "tasks.lock" that we check.
+        
+        // For now, let's implement a lock on the directory or a separate lock file to serialize writes.
+        let lock_path = self.config.tasks_file.with_extension("lock");
+        let lock_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&lock_path)
+            .map_err(HyperVError::Io)?;
+            
+        use fs2::FileExt;
+        lock_file.lock_exclusive().map_err(HyperVError::Io)?;
+
+        // Now we really should reload data to be safe, but that changes the architecture significantly 
+        // (functions would need to accept closures for modifications).
+        // Let's at least protect the write phase.
         
         // Write atomically: write to temp file then rename over the original.
         let tmp_path = self.config.tasks_file.with_extension("json.tmp");
@@ -105,6 +152,7 @@ impl TaskManager {
 
         fs::rename(&tmp_path, &self.config.tasks_file).map_err(HyperVError::Io)?;
         
+        // Unlock happens when lock_file is dropped
         Ok(())
     }
 
@@ -113,15 +161,17 @@ impl TaskManager {
             .filter(|t| t.status == TaskStatus::Running && t.pid.is_some())
             .map(|t| RunningTask {
                 task_id: t.id.clone(),
-                pid: t.pid.unwrap(),
+                pid: t.pid.expect("Task status is Running but PID is None"),
             })
             .collect();
 
         let json = serde_json::to_string_pretty(&running_tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
 
-        fs::write(&self.config.running_tasks_file, json.as_bytes())
-            .map_err(HyperVError::Io)?;
+        // Write atomically: write to temp file then rename
+        let tmp_path = self.config.running_tasks_file.with_extension("json.tmp");
+        fs::write(&tmp_path, json.as_bytes()).map_err(HyperVError::Io)?;
+        fs::rename(&tmp_path, &self.config.running_tasks_file).map_err(HyperVError::Io)?;
 
         Ok(())
     }

@@ -24,7 +24,7 @@ pub mod constants {
     pub const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
     
     /// Maximum number of automatic restart attempts
-    pub const MAX_RESTART_ATTEMPTS: u32 = 555;
+    pub const MAX_RESTART_ATTEMPTS: u32 = 5;
     
     /// Delay between restart attempts
     pub const RESTART_DELAY: Duration = Duration::from_secs(1);
