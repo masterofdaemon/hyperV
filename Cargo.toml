@@ -8,7 +8,8 @@ clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yml = "0.0.12"
-tokio = { version = "1.0", features = ["full", "signal"] }
+# Keep Tokio lean: we only use the async runtime, macros, time, select!, and ctrl_c().
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "signal"] }
 uuid = { version = "1.0", features = ["v4"] }
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
