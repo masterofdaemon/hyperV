@@ -39,6 +39,10 @@ pub struct Task {
     pub status: TaskStatus,
     pub created_at: String,
     pub pid: Option<u32>,
+    /// Best-effort process identity (used to detect PID reuse). On Unix, this typically matches
+    /// sysinfo's start_time() for the process at the moment we spawned it.
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
     pub stdout_log_path: Option<String>,
     pub stderr_log_path: Option<String>,
     pub last_started: Option<String>,
@@ -72,6 +76,7 @@ impl Task {
             status: TaskStatus::Stopped,
             created_at: chrono::Utc::now().to_rfc3339(),
             pid: None,
+            pid_start_time: None,
             stdout_log_path,
             stderr_log_path,
             last_started: None,
@@ -91,9 +96,15 @@ impl Task {
         self.pid = pid;
     }
 
+    /// Set task PID start time (used to detect PID reuse)
+    pub fn set_pid_start_time(&mut self, pid_start_time: Option<u64>) {
+        self.pid_start_time = pid_start_time;
+    }
+
     /// Clear task PID
     pub fn clear_pid(&mut self) {
         self.pid = None;
+        self.pid_start_time = None;
     }
 
     /// Set last started timestamp to now

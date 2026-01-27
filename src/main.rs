@@ -33,6 +33,10 @@ async fn main() -> Result<()> {
             task_manager.start_task(&task)?;
             maybe_spawn_daemon(&mut task_manager)?;
         }
+        Commands::Restart { task } => {
+            task_manager.restart_task(&task)?;
+            maybe_spawn_daemon(&mut task_manager)?;
+        }
         Commands::Stop { task } => {
             task_manager.stop_task(&task)?;
         }

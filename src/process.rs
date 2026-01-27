@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Process manager for handling running tasks
 pub struct ProcessManager {
@@ -27,12 +27,130 @@ impl ProcessManager {
         }
     }
 
+    fn is_pid_running(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            // kill(pid, 0) doesn't send a signal; it only performs error checking.
+            // - ESRCH: no such process
+            // - EPERM: process exists but we don't have permission (treat as running)
+            use libc::kill;
+            let rc = unsafe { kill(pid as i32, 0) };
+            if rc == 0 {
+                return true;
+            }
+            let err = std::io::Error::last_os_error();
+            return !matches!(err.raw_os_error(), Some(libc::ESRCH));
+        }
+
+        #[cfg(not(unix))]
+        {
+            use sysinfo::{Pid, System};
+            let mut system = System::new();
+            let pid = Pid::from_u32(pid);
+            system.refresh_process(pid)
+        }
+    }
+
+    fn is_pgid_running(pgid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            use libc::kill;
+            let rc = unsafe { kill(-(pgid as i32), 0) };
+            if rc == 0 {
+                return true;
+            }
+            let err = std::io::Error::last_os_error();
+            return !matches!(err.raw_os_error(), Some(libc::ESRCH));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = pgid;
+            false
+        }
+    }
+
     /// Check if a process with the given PID is running
     pub fn is_process_running(&self, pid: u32) -> bool {
-        use sysinfo::{System, Pid};
+        Self::is_pid_running(pid)
+    }
+
+    /// Check if a process group with the given PGID (usually the task's initial PID) is running.
+    pub fn is_process_group_running(&self, pgid: u32) -> bool {
+        Self::is_pgid_running(pgid)
+    }
+
+    /// Best-effort process start time used to detect PID reuse.
+    pub fn process_start_time(&self, pid: u32) -> Option<u64> {
+        use sysinfo::{Pid, System};
         let mut system = System::new();
         let pid = Pid::from_u32(pid);
-        system.refresh_process(pid)
+        if !system.refresh_process(pid) {
+            return None;
+        }
+        system.process(pid).map(|p| p.start_time())
+    }
+
+    /// Best-effort process exe path for identity checks.
+    pub fn process_exe(&self, pid: u32) -> Option<std::path::PathBuf> {
+        use sysinfo::{Pid, System};
+        let mut system = System::new();
+        let pid = Pid::from_u32(pid);
+        if !system.refresh_process(pid) {
+            return None;
+        }
+        system.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
+    }
+
+    /// Best-effort process command line for identity checks (useful for scripts launched via an interpreter).
+    pub fn process_cmd(&self, pid: u32) -> Option<Vec<String>> {
+        use sysinfo::{Pid, System};
+        let mut system = System::new();
+        let pid = Pid::from_u32(pid);
+        if !system.refresh_process(pid) {
+            return None;
+        }
+        system.process(pid).map(|p| p.cmd().to_vec())
+    }
+
+    /// Return true if the current process at `pid` appears to match the expected identity.
+    /// This is used to reduce the risk of killing an unrelated process after PID reuse.
+    pub fn pid_matches_identity(&self, pid: u32, binary: &str, pid_start_time: Option<u64>) -> bool {
+        // Prefer start_time: it's the strongest signal against PID reuse.
+        if let Some(expected) = pid_start_time {
+            return self
+                .process_start_time(pid)
+                .is_some_and(|actual| actual == expected);
+        }
+
+        // Fallback to exe path when we don't have a start_time snapshot.
+        if binary.is_empty() {
+            return true;
+        }
+
+        let expected = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.into());
+
+        // Prefer cmdline matching: scripts often show up as the interpreter in `exe()`,
+        // but the script path still appears in `cmd()`.
+        if let Some(cmd) = self.process_cmd(pid) {
+            for arg in cmd {
+                if arg == binary {
+                    return true;
+                }
+                let arg_path = std::path::PathBuf::from(&arg);
+                if let Ok(arg_canon) = std::fs::canonicalize(&arg_path) {
+                    if arg_canon == expected {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Fallback: exe path equality for normal binaries.
+        let actual = self
+            .process_exe(pid)
+            .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+        actual.is_some_and(|p| p == expected)
     }
 
     /// Start a task process
@@ -89,11 +207,53 @@ impl ProcessManager {
 
     /// Stop a task process gracefully
     pub fn stop_task(&mut self, task_id: &str, pid: u32) -> Result<()> {
+        // Take ownership of the Child so we can poll/reap without borrowing self.
+        // If the process doesn't actually terminate, we reinsert it.
+        let mut child = self.running_processes.remove(task_id);
+
+        let mut wait_for_exit = |timeout: Duration| -> bool {
+            let start = Instant::now();
+            while start.elapsed() < timeout {
+                if let Some(c) = child.as_mut() {
+                    // try_wait() reaps the child if it exited.
+                    let exited = matches!(c.try_wait(), Ok(Some(_)));
+                    if exited {
+                        child.take();
+                        return true;
+                    }
+                }
+
+                if !Self::is_pid_running(pid) && !Self::is_pgid_running(pid) {
+                    // If the OS no longer reports it running, best-effort reap to avoid zombies.
+                    if let Some(mut c) = child.take() {
+                        let _ = c.try_wait();
+                        let _ = c.wait();
+                    }
+                    return true;
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            // One final check at the boundary.
+            if let Some(c) = child.as_mut() {
+                let exited = matches!(c.try_wait(), Ok(Some(_)));
+                if exited {
+                    child.take();
+                    return true;
+                }
+            }
+            !Self::is_pid_running(pid) && !Self::is_pgid_running(pid)
+        };
+
         // First check if the process is actually running
-        if !self.is_process_running(pid) {
+        if !Self::is_pid_running(pid) && !Self::is_pgid_running(pid) {
             println!("ℹ️  Process {} is already stopped", pid);
-            // Remove from running processes if it's there
-            self.running_processes.remove(task_id);
+            // Best-effort reap any tracked child to avoid zombies.
+            if let Some(mut c) = child.take() {
+                let _ = c.try_wait();
+                let _ = c.wait();
+            }
             return Ok(());
         }
 
@@ -112,9 +272,12 @@ impl ProcessManager {
                 let process_result = unsafe { kill(pid as i32, SIGTERM) };
                 if process_result != 0 {
                     // Check if the process died between our checks
-                    if !self.is_process_running(pid) {
+                    if !Self::is_pid_running(pid) {
                         println!("ℹ️  Process {} terminated during stop attempt", pid);
-                        self.running_processes.remove(task_id);
+                        if let Some(mut c) = child.take() {
+                            let _ = c.try_wait();
+                            let _ = c.wait();
+                        }
                         return Ok(());
                     }
                     
@@ -127,12 +290,8 @@ impl ProcessManager {
             }
             
             println!("⏳ Waiting {} seconds for graceful shutdown...", SHUTDOWN_TIMEOUT.as_secs());
-            
-            // Wait for graceful shutdown
-            thread::sleep(SHUTDOWN_TIMEOUT);
-            
-            // Check if process is still running
-            if self.is_process_running(pid) {
+
+            if !wait_for_exit(SHUTDOWN_TIMEOUT) {
                 println!("💀 Process still running, sending SIGKILL...");
                 
                 // Try SIGKILL on process group first, then individual process
@@ -141,33 +300,58 @@ impl ProcessManager {
                     let process_kill_result = unsafe { kill(pid as i32, SIGKILL) };
                     if process_kill_result != 0 {
                         // Check if the process died during our attempts
-                        if !self.is_process_running(pid) {
+                        if !Self::is_pid_running(pid) {
                             println!("ℹ️  Process {} terminated during kill attempt", pid);
-                            self.running_processes.remove(task_id);
+                            if let Some(mut c) = child.take() {
+                                let _ = c.try_wait();
+                                let _ = c.wait();
+                            }
                             return Ok(());
                         }
                         
                         let errno = std::io::Error::last_os_error();
+                        if let Some(c) = child.take() {
+                            self.running_processes.insert(task_id.to_string(), c);
+                        }
                         return Err(HyperVError::ProcessStop(
                             format!("Failed to kill process {} (errno: {})", pid, errno)
                         ));
                     }
                 }
-                thread::sleep(Duration::from_millis(500)); // Give it time to die
+
+                // Give it a chance to actually terminate after SIGKILL.
+                let kill_timeout = Duration::from_secs(2);
+                if !wait_for_exit(kill_timeout) {
+                    if let Some(c) = child.take() {
+                        self.running_processes.insert(task_id.to_string(), c);
+                    }
+                    return Err(HyperVError::ProcessStop(
+                        format!("Process {} did not terminate after SIGKILL", pid)
+                    ));
+                }
             }
         }
 
         #[cfg(not(unix))]
         {
             // On non-Unix systems, try to terminate the child process
-            if let Some(mut child) = self.running_processes.remove(task_id) {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(mut c) = child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            } else if Self::is_pid_running(pid) {
+                return Err(HyperVError::ProcessStop(format!(
+                    "Process {} is still running but is not managed by this daemon",
+                    pid
+                )));
             }
         }
 
-        // Remove from running processes
-        self.running_processes.remove(task_id);
+        // If we still have a tracked child here, ensure it's reaped before dropping.
+        if let Some(mut c) = child.take() {
+            let _ = c.try_wait();
+            let _ = c.wait();
+        }
+
         Ok(())
     }
 

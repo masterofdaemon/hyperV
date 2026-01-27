@@ -42,6 +42,11 @@ pub enum Commands {
         /// Task name or ID
         task: String,
     },
+    /// Restart a task (stop if running, then start)
+    Restart {
+        /// Task name or ID
+        task: String,
+    },
     /// Stop a task
     Stop {
         /// Task name or ID
@@ -94,4 +99,3 @@ pub enum Commands {
         file: String,
     },
 }
-

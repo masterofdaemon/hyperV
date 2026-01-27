@@ -19,6 +19,10 @@ use sysinfo::{System, Pid};
 struct RunningTask {
     task_id: String,
     pid: u32,
+    #[serde(default)]
+    pid_start_time: Option<u64>,
+    #[serde(default)]
+    binary: String,
 }
 
 /// Main task manager that coordinates all operations
@@ -67,15 +71,23 @@ impl TaskManager {
                 .map_err(HyperVError::Io)?;
             if let Ok(running_tasks) = serde_json::from_str::<Vec<RunningTask>>(&content) {
                 for running_task in running_tasks {
-                    use sysinfo::{System, Pid};
-                    // Use sysinfo to check process
-                    let mut sys = System::new();
-                    let pid = Pid::from_u32(running_task.pid);
-                    if sys.refresh_process(pid) {
-                         if let Some(task) = manager.tasks.iter_mut().find(|t| t.id == running_task.task_id) {
-                            task.set_status(TaskStatus::Running);
-                            task.set_pid(Some(running_task.pid));
-                        }
+                    let pid = running_task.pid;
+                    if !manager.process_manager.is_process_running(pid) {
+                        continue;
+                    }
+
+                    if !manager.process_manager.pid_matches_identity(
+                        pid,
+                        &running_task.binary,
+                        running_task.pid_start_time,
+                    ) {
+                        continue;
+                    }
+
+                    if let Some(task) = manager.tasks.iter_mut().find(|t| t.id == running_task.task_id) {
+                        task.set_status(TaskStatus::Running);
+                        task.set_pid(Some(pid));
+                        task.set_pid_start_time(running_task.pid_start_time);
                     }
                 }
             }
@@ -157,13 +169,24 @@ impl TaskManager {
     }
 
     fn save_running_tasks(&self) -> Result<()> {
-        let running_tasks: Vec<RunningTask> = self.tasks.iter()
-            .filter(|t| t.status == TaskStatus::Running && t.pid.is_some())
-            .map(|t| RunningTask {
+        let mut running_tasks: Vec<RunningTask> = Vec::new();
+        for t in &self.tasks {
+            if t.status != TaskStatus::Running {
+                continue;
+            }
+            let pid = t.pid.ok_or_else(|| {
+                HyperVError::ProcessError(format!(
+                    "Invariant violation: task \"{}\" is Running but has no PID",
+                    t.name
+                ))
+            })?;
+            running_tasks.push(RunningTask {
                 task_id: t.id.clone(),
-                pid: t.pid.expect("Task status is Running but PID is None"),
-            })
-            .collect();
+                pid,
+                pid_start_time: t.pid_start_time,
+                binary: t.binary.clone(),
+            });
+        }
 
         let json = serde_json::to_string_pretty(&running_tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
@@ -310,7 +333,14 @@ impl TaskManager {
         // Check if task is already running
         if task.status == TaskStatus::Running {
             if let Some(pid) = task.pid {
-                if self.process_manager.is_process_running(pid) {
+                let pid_running = self.process_manager.is_process_running(pid);
+                let group_running = self.process_manager.is_process_group_running(pid);
+                if (pid_running || group_running)
+                    && (!pid_running
+                        || self
+                            .process_manager
+                            .pid_matches_identity(pid, &task.binary, task.pid_start_time))
+                {
                     return Err(HyperVError::TaskAlreadyRunning(task.name));
                 } else {
                     // Process died, update status
@@ -370,10 +400,12 @@ impl TaskManager {
         // Start the process
         match self.process_manager.start_task(&task, &task_env, &stdout_path, &stderr_path) {
             Ok(pid) => {
+                let pid_start_time = self.process_manager.process_start_time(pid);
                 // Update task state
                 if let Some(task_mut) = self.find_task_mut(identifier) {
                     task_mut.set_status(TaskStatus::Running);
                     task_mut.set_pid(Some(pid));
+                    task_mut.set_pid_start_time(pid_start_time);
                     task_mut.set_last_started();
                     task_mut.clear_suppress_restart();
                 }
@@ -396,7 +428,7 @@ impl TaskManager {
 
     /// Stop a task
     pub fn stop_task(&mut self, identifier: &str) -> Result<()> {
-        let (task_name, task_id, pid) = {
+        let (task_name, task_id, pid, binary, pid_start_time) = {
             let task = self.find_task(identifier)
                 .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
@@ -404,15 +436,52 @@ impl TaskManager {
                 println!("ℹ️  Task \"{}\" is already stopped", task.name);
                 return Ok(());
             }
-            (task.name.clone(), task.id.clone(), task.pid)
+            (task.name.clone(), task.id.clone(), task.pid, task.binary.clone(), task.pid_start_time)
         };
 
-        if let Some(pid) = pid {
-            if !self.process_manager.is_process_running(pid) {
-                println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
-            } else {
-                println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
-                self.process_manager.stop_task(&task_id, pid)?;
+        let pid = pid.ok_or_else(|| {
+            HyperVError::ProcessError(format!(
+                "Task \"{}\" is marked Running but has no PID (state corrupted)",
+                task_name
+            ))
+        })?;
+
+        let pid_running = self.process_manager.is_process_running(pid);
+        let group_running = self.process_manager.is_process_group_running(pid);
+
+        if !pid_running && !group_running {
+            println!("ℹ️  Process {} for task \"{}\" has already terminated", pid, task_name);
+        } else if pid_running {
+            // Detect PID reuse before sending signals: refuse to kill if it doesn't match.
+            if !self.process_manager.pid_matches_identity(pid, &binary, pid_start_time) {
+                return Err(HyperVError::ProcessStop(format!(
+                    "Refusing to stop PID {} for task \"{}\": PID appears to have been reused",
+                    pid, task_name
+                )));
+            }
+
+            println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
+            self.process_manager.stop_task(&task_id, pid)?;
+            // Defensive: only mark stopped if the PID is actually gone.
+            if self.process_manager.is_process_running(pid) || self.process_manager.is_process_group_running(pid) {
+                return Err(HyperVError::ProcessStop(format!(
+                    "Process {} for task \"{}\" did not terminate",
+                    pid, task_name
+                )));
+            }
+        } else {
+            // The original PID is gone but the process group is still alive (e.g., task forked and exited).
+            // We can still stop the group by PGID (= original PID).
+            println!(
+                "⚠️  Task \"{}\" PID {} is gone but its process group is still running; stopping group...",
+                task_name, pid
+            );
+            self.process_manager.stop_task(&task_id, pid)?;
+            if self.process_manager.is_process_group_running(pid) {
+                return Err(HyperVError::ProcessStop(format!(
+                    "Process group {} for task \"{}\" did not terminate",
+                    pid, task_name
+                )));
             }
         }
 
@@ -426,6 +495,22 @@ impl TaskManager {
         self.save_running_tasks()?;
         println!("✅ Task \"{}\" stopped", task_name);
         Ok(())
+    }
+
+    /// Restart a task (stop if running, then start).
+    pub fn restart_task(&mut self, identifier: &str) -> Result<()> {
+        let (task_name, is_running) = {
+            let task = self
+                .find_task(identifier)
+                .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
+            (task.name.clone(), task.status == TaskStatus::Running)
+        };
+
+        if is_running {
+            self.stop_task(identifier)?;
+        }
+
+        self.start_task(&task_name)
     }
 
     /// Remove a task
@@ -569,10 +654,20 @@ impl TaskManager {
         for task in &mut self.tasks {
             if task.status == TaskStatus::Running {
                 if let Some(pid) = task.pid {
-                    if !self.process_manager.is_process_running(pid) {
+                    let pid_running = self.process_manager.is_process_running(pid);
+                    let group_running = self.process_manager.is_process_group_running(pid);
+                    let matches = !pid_running
+                        || self
+                            .process_manager
+                            .pid_matches_identity(pid, &task.binary, task.pid_start_time);
+                    if (!pid_running && !group_running) || !matches {
                         // Process has terminated, update status
                         task.set_status(TaskStatus::Failed);
                         task.clear_pid();
+                        updated = true;
+                    } else if pid_running && task.pid_start_time.is_none() {
+                        // Upgrade older state so future stop checks can use start_time.
+                        task.set_pid_start_time(self.process_manager.process_start_time(pid));
                         updated = true;
                     }
                 }
@@ -620,7 +715,13 @@ impl TaskManager {
         for task in &mut self.tasks {
             if task.status == TaskStatus::Running {
                 if let Some(pid) = task.pid {
-                    if !self.process_manager.is_process_running(pid) {
+                    let pid_running = self.process_manager.is_process_running(pid);
+                    let group_running = self.process_manager.is_process_group_running(pid);
+                    let matches = !pid_running
+                        || self
+                            .process_manager
+                            .pid_matches_identity(pid, &task.binary, task.pid_start_time);
+                    if (!pid_running && !group_running) || !matches {
                         // Check if we have an exit code for this task
                         if let Some(&exit_code) = exit_codes.get(&task.id) {
                             task.set_exit_code(Some(exit_code));
@@ -629,6 +730,9 @@ impl TaskManager {
                         
                         task.set_status(TaskStatus::Failed);
                         task.clear_pid();
+                        changed = true;
+                    } else if pid_running && task.pid_start_time.is_none() {
+                        task.set_pid_start_time(self.process_manager.process_start_time(pid));
                         changed = true;
                     }
                 }
