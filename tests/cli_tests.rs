@@ -1,3 +1,9 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::zombie_processes,
+    deprecated
+)]
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -33,7 +39,9 @@ fn test_help() {
         .assert()
         .success()
         // Check for the "about" text configured in Clap
-        .stdout(predicate::str::contains("A service manager for running binary files"));
+        .stdout(predicate::str::contains(
+            "A service manager for running binary files",
+        ));
 }
 
 #[test]
@@ -95,7 +103,7 @@ fn test_lifecycle() {
 fn test_persistence() {
     let temp = TempDir::new().unwrap();
     let ls_bin = bin_path("/bin/ls", "/usr/bin/ls");
-    
+
     // Create task
     hyperv_cmd(&temp)
         .args(&["new", "--name", "persist-task", "--binary", ls_bin])
@@ -108,7 +116,7 @@ fn test_persistence() {
         .assert()
         .success()
         .stdout(predicate::str::contains("persist-task"));
-    
+
     // "Restart" app - reusing the same temp dir simulates this
     hyperv_cmd(&temp)
         .arg("list")
@@ -167,19 +175,44 @@ fn test_long_running() {
         .success()
         .stdout(predicate::str::contains("Running"))
         .stdout(predicate::str::contains("PID:"));
-        
+
     // Stop it
     hyperv_cmd(&temp)
         .args(&["stop", "sleeper"])
         .assert()
         .success();
-        
+
     // Verify stopped
     hyperv_cmd(&temp)
         .args(&["status", "sleeper"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Stopped"));
+}
+
+#[test]
+fn test_status_refreshes_finished_process() {
+    let temp = TempDir::new().unwrap();
+    let true_bin = bin_path("/bin/true", "/usr/bin/true");
+
+    hyperv_cmd(&temp)
+        .args(&["new", "--name", "oneshot", "--binary", true_bin])
+        .assert()
+        .success();
+
+    hyperv_cmd(&temp)
+        .args(&["start", "oneshot"])
+        .assert()
+        .success();
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    hyperv_cmd(&temp)
+        .args(&["status", "oneshot"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Failed"))
+        .stdout(predicate::str::contains("Running").not());
 }
 
 #[test]
@@ -218,7 +251,7 @@ fn test_restart_command() {
 fn test_daemon_locking() {
     let temp = TempDir::new().unwrap();
     let bin_path = assert_cmd::cargo::cargo_bin("hyperV");
-    
+
     // Start daemon in background using std::process::Command
     let mut child = std::process::Command::new(&bin_path)
         .arg("daemon")
@@ -228,17 +261,17 @@ fn test_daemon_locking() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    
+
     // Give it a moment to start and lock
     std::thread::sleep(std::time::Duration::from_millis(500));
-    
+
     // Try to start another daemon using assert_cmd
     hyperv_cmd(&temp)
         .arg("daemon")
         .assert()
         .failure() // Should fail
         .stderr(predicate::str::contains("Daemon is already running"));
-        
+
     // Clean up
     #[cfg(unix)]
     {

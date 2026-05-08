@@ -1,5 +1,5 @@
 //! Process management for hyperV
-//! 
+//!
 //! Handles process spawning, monitoring, and termination with proper signal handling.
 
 use crate::constants::SHUTDOWN_TIMEOUT;
@@ -39,7 +39,7 @@ impl ProcessManager {
                 return true;
             }
             let err = std::io::Error::last_os_error();
-            return !matches!(err.raw_os_error(), Some(libc::ESRCH));
+            !matches!(err.raw_os_error(), Some(libc::ESRCH))
         }
 
         #[cfg(not(unix))]
@@ -60,7 +60,7 @@ impl ProcessManager {
                 return true;
             }
             let err = std::io::Error::last_os_error();
-            return !matches!(err.raw_os_error(), Some(libc::ESRCH));
+            !matches!(err.raw_os_error(), Some(libc::ESRCH))
         }
 
         #[cfg(not(unix))]
@@ -99,7 +99,9 @@ impl ProcessManager {
         if !system.refresh_process(pid) {
             return None;
         }
-        system.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
+        system
+            .process(pid)
+            .and_then(|p| p.exe().map(|p| p.to_path_buf()))
     }
 
     /// Best-effort process command line for identity checks (useful for scripts launched via an interpreter).
@@ -115,7 +117,12 @@ impl ProcessManager {
 
     /// Return true if the current process at `pid` appears to match the expected identity.
     /// This is used to reduce the risk of killing an unrelated process after PID reuse.
-    pub fn pid_matches_identity(&self, pid: u32, binary: &str, pid_start_time: Option<u64>) -> bool {
+    pub fn pid_matches_identity(
+        &self,
+        pid: u32,
+        binary: &str,
+        pid_start_time: Option<u64>,
+    ) -> bool {
         // Prefer start_time: it's the strongest signal against PID reuse.
         if let Some(expected) = pid_start_time {
             return self
@@ -138,10 +145,10 @@ impl ProcessManager {
                     return true;
                 }
                 let arg_path = std::path::PathBuf::from(&arg);
-                if let Ok(arg_canon) = std::fs::canonicalize(&arg_path) {
-                    if arg_canon == expected {
-                        return true;
-                    }
+                if let Ok(arg_canon) = std::fs::canonicalize(&arg_path)
+                    && arg_canon == expected
+                {
+                    return true;
                 }
             }
         }
@@ -154,19 +161,25 @@ impl ProcessManager {
     }
 
     /// Start a task process
-    pub fn start_task(&mut self, task: &Task, task_env: &HashMap<String, String>, stdout_log: &Path, stderr_log: &Path) -> Result<u32> {
+    pub fn start_task(
+        &mut self,
+        task: &Task,
+        task_env: &HashMap<String, String>,
+        stdout_log: &Path,
+        stderr_log: &Path,
+    ) -> Result<u32> {
         // Validate the binary before starting
         self.validate_binary(&task.binary)?;
 
         // Create command
         let mut cmd = Command::new(&task.binary);
         cmd.args(&task.args);
-        
+
         // Set environment variables
         for (key, value) in task_env {
             cmd.env(key, value);
         }
-        
+
         // Set working directory
         if let Some(workdir) = &task.workdir {
             cmd.current_dir(workdir);
@@ -178,7 +191,7 @@ impl ProcessManager {
             .append(true)
             .open(stdout_log)
             .map_err(HyperVError::Io)?;
-        
+
         let stderr_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -196,7 +209,8 @@ impl ProcessManager {
         }
 
         // Spawn the process
-        let child = cmd.spawn()
+        let child = cmd
+            .spawn()
             .map_err(|e| HyperVError::ProcessStart(task.binary.clone(), e.to_string()))?;
 
         let pid = child.id();
@@ -260,12 +274,12 @@ impl ProcessManager {
         // First try graceful shutdown with SIGTERM
         #[cfg(unix)]
         {
-            use libc::{kill, SIGTERM, SIGKILL};
-            
+            use libc::{SIGKILL, SIGTERM, kill};
+
             // Try to send SIGTERM to the process group first
             println!("🛑 Sending SIGTERM to process group {}", pid);
             let group_result = unsafe { kill(-(pid as i32), SIGTERM) };
-            
+
             if group_result != 0 {
                 // If process group signal failed, try signaling the individual process
                 println!("⚠️  Process group signal failed, trying individual process...");
@@ -280,20 +294,24 @@ impl ProcessManager {
                         }
                         return Ok(());
                     }
-                    
+
                     // Get errno for better error reporting
                     let errno = std::io::Error::last_os_error();
-                    return Err(HyperVError::ProcessStop(
-                        format!("Failed to send SIGTERM to process {} (errno: {})", pid, errno)
-                    ));
+                    return Err(HyperVError::ProcessStop(format!(
+                        "Failed to send SIGTERM to process {} (errno: {})",
+                        pid, errno
+                    )));
                 }
             }
-            
-            println!("⏳ Waiting {} seconds for graceful shutdown...", SHUTDOWN_TIMEOUT.as_secs());
+
+            println!(
+                "⏳ Waiting {} seconds for graceful shutdown...",
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
 
             if !wait_for_exit(SHUTDOWN_TIMEOUT) {
                 println!("💀 Process still running, sending SIGKILL...");
-                
+
                 // Try SIGKILL on process group first, then individual process
                 let group_kill_result = unsafe { kill(-(pid as i32), SIGKILL) };
                 if group_kill_result != 0 {
@@ -308,14 +326,15 @@ impl ProcessManager {
                             }
                             return Ok(());
                         }
-                        
+
                         let errno = std::io::Error::last_os_error();
                         if let Some(c) = child.take() {
                             self.running_processes.insert(task_id.to_string(), c);
                         }
-                        return Err(HyperVError::ProcessStop(
-                            format!("Failed to kill process {} (errno: {})", pid, errno)
-                        ));
+                        return Err(HyperVError::ProcessStop(format!(
+                            "Failed to kill process {} (errno: {})",
+                            pid, errno
+                        )));
                     }
                 }
 
@@ -325,9 +344,10 @@ impl ProcessManager {
                     if let Some(c) = child.take() {
                         self.running_processes.insert(task_id.to_string(), c);
                     }
-                    return Err(HyperVError::ProcessStop(
-                        format!("Process {} did not terminate after SIGKILL", pid)
-                    ));
+                    return Err(HyperVError::ProcessStop(format!(
+                        "Process {} did not terminate after SIGKILL",
+                        pid
+                    )));
                 }
             }
         }
@@ -358,7 +378,7 @@ impl ProcessManager {
     /// Validate that a binary file exists and is executable
     fn validate_binary(&self, binary_path: &str) -> Result<()> {
         let path = Path::new(binary_path);
-        
+
         // Check if file exists
         if !path.exists() {
             return Err(HyperVError::BinaryNotFound(binary_path.to_string()));
@@ -368,10 +388,9 @@ impl ProcessManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(path)
-                .map_err(HyperVError::Io)?;
+            let metadata = std::fs::metadata(path).map_err(HyperVError::Io)?;
             let permissions = metadata.permissions();
-            
+
             if permissions.mode() & 0o111 == 0 {
                 return Err(HyperVError::BinaryNotExecutable(binary_path.to_string()));
             }
@@ -385,30 +404,32 @@ impl ProcessManager {
 
     /// Validate script files and check for proper shebang
     fn validate_script(&self, path: &Path) -> Result<()> {
-        let mut file = std::fs::File::open(path)
-            .map_err(HyperVError::Io)?;
-        
+        let mut file = std::fs::File::open(path).map_err(HyperVError::Io)?;
+
         let mut buffer = [0; 512];
         let bytes_read = file.read(&mut buffer).unwrap_or(0);
-        
+
         if bytes_read >= 2 && buffer[0] == 0x23 && buffer[1] == 0x21 {
             // Has shebang - validate interpreter
             let shebang_content = String::from_utf8_lossy(&buffer[..bytes_read.min(256)]);
-            let shebang_line = shebang_content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            
+            let shebang_line = shebang_content.lines().next().unwrap_or("").trim();
+
             if let Some(interpreter) = shebang_line.strip_prefix("#!") {
-                let interpreter = interpreter.trim().split_whitespace().next().unwrap_or("");
+                let interpreter = interpreter.split_whitespace().next().unwrap_or("");
                 if !interpreter.is_empty() && !Path::new(interpreter).exists() {
                     return Err(HyperVError::InterpreterNotFound(interpreter.to_string()));
                 }
             }
-        } else if buffer.iter().take(bytes_read).all(|&b| b.is_ascii() && b != 0) {
+        } else if buffer
+            .iter()
+            .take(bytes_read)
+            .all(|&b| b.is_ascii() && b != 0)
+        {
             // Text file without shebang - warn but don't error
-            eprintln!("⚠️  Warning: Text file without shebang detected: {}", path.display());
+            eprintln!(
+                "⚠️  Warning: Text file without shebang detected: {}",
+                path.display()
+            );
             eprintln!("💡 If this is a shell script, add '#!/bin/bash' as the first line");
         }
 
@@ -429,7 +450,7 @@ impl ProcessManager {
     pub fn cleanup_zombies(&mut self) -> HashMap<String, i32> {
         let mut to_remove = Vec::new();
         let mut exit_codes = HashMap::new();
-        
+
         for (task_id, child) in &mut self.running_processes {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -445,7 +466,7 @@ impl ProcessManager {
                 }
             }
         }
-        
+
         for task_id in to_remove {
             self.running_processes.remove(&task_id);
         }
@@ -462,36 +483,37 @@ impl Default for ProcessManager {
 /// Diagnose issues with a binary file
 pub fn diagnose_binary(binary_path: &str) -> Result<()> {
     let path = Path::new(binary_path);
-    
+
     println!("🔍 Diagnosing binary: {}", binary_path);
     println!();
-    
+
     // Check file existence
     if !path.exists() {
         println!("❌ File does not exist");
         return Err(HyperVError::BinaryNotFound(binary_path.to_string()));
     }
     println!("✅ File exists");
-    
+
     // Check file type
-    let metadata = std::fs::metadata(path)
-        .map_err(HyperVError::Io)?;
-    
+    let metadata = std::fs::metadata(path).map_err(HyperVError::Io)?;
+
     if metadata.is_dir() {
         println!("❌ Path points to a directory, not a file");
-        return Err(HyperVError::InvalidBinary("Path is a directory".to_string()));
+        return Err(HyperVError::InvalidBinary(
+            "Path is a directory".to_string(),
+        ));
     }
     println!("✅ Is a file");
-    
+
     // Check permissions
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let permissions = metadata.permissions();
         let mode = permissions.mode();
-        
+
         println!("📋 File permissions: {:o}", mode & 0o777);
-        
+
         if mode & 0o111 == 0 {
             println!("❌ File is not executable");
             println!("💡 Fix with: chmod +x {}", binary_path);
@@ -499,51 +521,51 @@ pub fn diagnose_binary(binary_path: &str) -> Result<()> {
         }
         println!("✅ File is executable");
     }
-    
+
     // Analyze file content
-    let mut file = std::fs::File::open(path)
-        .map_err(HyperVError::Io)?;
-    
+    let mut file = std::fs::File::open(path).map_err(HyperVError::Io)?;
+
     let mut buffer = [0; 512];
     let bytes_read = file.read(&mut buffer).unwrap_or(0);
-    
+
     if bytes_read == 0 {
         println!("❌ File is empty");
         return Err(HyperVError::InvalidBinary("File is empty".to_string()));
     }
-    
+
     // Check for binary vs text
-    let is_binary = buffer.iter().take(bytes_read).any(|&b| b == 0 || (!b.is_ascii() && b != b'\n' && b != b'\r' && b != b'\t'));
-    
+    let is_binary = buffer
+        .iter()
+        .take(bytes_read)
+        .any(|&b| b == 0 || (!b.is_ascii() && b != b'\n' && b != b'\r' && b != b'\t'));
+
     if is_binary {
         println!("✅ Detected binary file");
-        
+
         // Check for common binary formats
         if bytes_read >= 4 {
             match &buffer[0..4] {
                 [0x7f, b'E', b'L', b'F'] => println!("📋 Format: ELF executable (Linux)"),
-                [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] => println!("📋 Format: Mach-O executable (macOS)"),
+                [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] => {
+                    println!("📋 Format: Mach-O executable (macOS)")
+                }
                 [b'M', b'Z', _, _] => println!("📋 Format: PE executable (Windows)"),
                 _ => println!("📋 Format: Unknown binary format"),
             }
         }
     } else {
         println!("📋 Detected text file (script)");
-        
+
         // Check for shebang
         if bytes_read >= 2 && buffer[0] == 0x23 && buffer[1] == 0x21 {
             let shebang_content = String::from_utf8_lossy(&buffer[..bytes_read.min(256)]);
-            let shebang_line = shebang_content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            
+            let shebang_line = shebang_content.lines().next().unwrap_or("").trim();
+
             println!("✅ Has shebang: {}", shebang_line);
-            
+
             // Validate interpreter
             if let Some(interpreter) = shebang_line.strip_prefix("#!") {
-                let interpreter = interpreter.trim().split_whitespace().next().unwrap_or("");
+                let interpreter = interpreter.split_whitespace().next().unwrap_or("");
                 if !interpreter.is_empty() {
                     if Path::new(interpreter).exists() {
                         println!("✅ Interpreter exists: {}", interpreter);
@@ -559,7 +581,7 @@ pub fn diagnose_binary(binary_path: &str) -> Result<()> {
             println!("💡 Add a shebang line like '#!/bin/bash' as the first line");
         }
     }
-    
+
     println!();
     println!("🎯 Diagnosis complete - binary appears valid");
     Ok(())

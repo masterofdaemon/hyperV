@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
             task_manager.remove_task(&task)?;
         }
         Commands::Status { task } => {
-            task_manager.show_status(task.as_deref());
+            task_manager.show_status(task.as_deref())?;
         }
         Commands::Logs { task, lines, log_type, follow } => {
             task_manager.show_logs(&task, lines, log_type, follow)?;

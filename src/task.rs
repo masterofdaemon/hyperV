@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Task status enumeration
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -54,6 +54,7 @@ pub struct Task {
 
 impl Task {
     /// Create a new task with the given parameters
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         name: String,
@@ -134,30 +135,33 @@ impl Task {
         println!("Binary: {}", self.binary);
         println!("Args: {:?}", self.args);
         println!("Status: {}", self.status);
-        
+
         if let Some(pid) = self.pid {
             println!("PID: {}", pid);
         }
-        
+
         if let Some(exit_code) = self.last_exit_code {
             println!("Last exit code: {}", exit_code);
         }
-        
-        println!("Auto-restart: {} (restarts: {})", self.auto_restart, self.restart_count);
-        
+
+        println!(
+            "Auto-restart: {} (restarts: {})",
+            self.auto_restart, self.restart_count
+        );
+
         if let Some(workdir) = &self.workdir {
             println!("Working directory: {}", workdir);
         }
-        
+
         if !self.env.is_empty() {
             println!("Environment variables:");
             for (key, value) in &self.env {
                 println!("  {}={}", key, value);
             }
         }
-        
+
         println!("Created: {}", self.created_at);
-        
+
         if let Some(last_started) = &self.last_started {
             println!("Last started: {}", last_started);
         }
