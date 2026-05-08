@@ -6,6 +6,8 @@ use crate::constants::SHUTDOWN_TIMEOUT;
 use crate::error::{HyperVError, Result};
 use crate::task::Task;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -68,6 +70,34 @@ impl ProcessManager {
             let _ = pgid;
             false
         }
+    }
+
+    #[cfg(unix)]
+    fn process_group_id(pid: u32) -> Option<u32> {
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        if pgid > 0 { Some(pgid as u32) } else { None }
+    }
+
+    #[cfg(unix)]
+    fn descendant_pids(root_pid: u32) -> Vec<u32> {
+        use sysinfo::{Pid, System};
+
+        let mut system = System::new();
+        system.refresh_processes();
+
+        let mut descendants = Vec::new();
+        let mut stack = vec![Pid::from_u32(root_pid)];
+
+        while let Some(parent_pid) = stack.pop() {
+            for (pid, process) in system.processes() {
+                if process.parent() == Some(parent_pid) {
+                    descendants.push(pid.as_u32());
+                    stack.push(*pid);
+                }
+            }
+        }
+
+        descendants
     }
 
     /// Check if a process with the given PID is running
@@ -276,32 +306,60 @@ impl ProcessManager {
         {
             use libc::{SIGKILL, SIGTERM, kill};
 
+            let descendant_pids = Self::descendant_pids(pid);
+            let mut watched_pids = descendant_pids.clone();
+            watched_pids.push(pid);
+
+            let mut watched_pgids = HashSet::new();
+            watched_pgids.insert(pid);
+            for child_pid in &descendant_pids {
+                if let Some(pgid) = Self::process_group_id(*child_pid) {
+                    watched_pgids.insert(pgid);
+                }
+            }
+
+            let all_stopped = |watched_pids: &[u32], watched_pgids: &HashSet<u32>| {
+                !watched_pids.iter().any(|pid| Self::is_pid_running(*pid))
+                    && !watched_pgids
+                        .iter()
+                        .any(|pgid| Self::is_pgid_running(*pgid))
+            };
+
+            let send_signal = |signal| {
+                let mut sent = false;
+                for pgid in &watched_pgids {
+                    if unsafe { kill(-(*pgid as i32), signal) } == 0 {
+                        sent = true;
+                    }
+                }
+                for watched_pid in &watched_pids {
+                    if Self::is_pid_running(*watched_pid)
+                        && unsafe { kill(*watched_pid as i32, signal) } == 0
+                    {
+                        sent = true;
+                    }
+                }
+                sent
+            };
+
             // Try to send SIGTERM to the process group first
             println!("🛑 Sending SIGTERM to process group {}", pid);
-            let group_result = unsafe { kill(-(pid as i32), SIGTERM) };
-
-            if group_result != 0 {
-                // If process group signal failed, try signaling the individual process
-                println!("⚠️  Process group signal failed, trying individual process...");
-                let process_result = unsafe { kill(pid as i32, SIGTERM) };
-                if process_result != 0 {
-                    // Check if the process died between our checks
-                    if !Self::is_pid_running(pid) {
-                        println!("ℹ️  Process {} terminated during stop attempt", pid);
-                        if let Some(mut c) = child.take() {
-                            let _ = c.try_wait();
-                            let _ = c.wait();
-                        }
-                        return Ok(());
+            if !send_signal(SIGTERM) {
+                // Check if the process died between our checks
+                if all_stopped(&watched_pids, &watched_pgids) {
+                    println!("ℹ️  Process {} terminated during stop attempt", pid);
+                    if let Some(mut c) = child.take() {
+                        let _ = c.try_wait();
+                        let _ = c.wait();
                     }
-
-                    // Get errno for better error reporting
-                    let errno = std::io::Error::last_os_error();
-                    return Err(HyperVError::ProcessStop(format!(
-                        "Failed to send SIGTERM to process {} (errno: {})",
-                        pid, errno
-                    )));
+                    return Ok(());
                 }
+
+                let errno = std::io::Error::last_os_error();
+                return Err(HyperVError::ProcessStop(format!(
+                    "Failed to send SIGTERM to process {} or its children (errno: {})",
+                    pid, errno
+                )));
             }
 
             println!(
@@ -312,40 +370,35 @@ impl ProcessManager {
             if !wait_for_exit(SHUTDOWN_TIMEOUT) {
                 println!("💀 Process still running, sending SIGKILL...");
 
-                // Try SIGKILL on process group first, then individual process
-                let group_kill_result = unsafe { kill(-(pid as i32), SIGKILL) };
-                if group_kill_result != 0 {
-                    let process_kill_result = unsafe { kill(pid as i32, SIGKILL) };
-                    if process_kill_result != 0 {
-                        // Check if the process died during our attempts
-                        if !Self::is_pid_running(pid) {
-                            println!("ℹ️  Process {} terminated during kill attempt", pid);
-                            if let Some(mut c) = child.take() {
-                                let _ = c.try_wait();
-                                let _ = c.wait();
-                            }
-                            return Ok(());
+                if !send_signal(SIGKILL) {
+                    // Check if the process died during our attempts
+                    if all_stopped(&watched_pids, &watched_pgids) {
+                        println!("ℹ️  Process {} terminated during kill attempt", pid);
+                        if let Some(mut c) = child.take() {
+                            let _ = c.try_wait();
+                            let _ = c.wait();
                         }
-
-                        let errno = std::io::Error::last_os_error();
-                        if let Some(c) = child.take() {
-                            self.running_processes.insert(task_id.to_string(), c);
-                        }
-                        return Err(HyperVError::ProcessStop(format!(
-                            "Failed to kill process {} (errno: {})",
-                            pid, errno
-                        )));
+                        return Ok(());
                     }
-                }
 
-                // Give it a chance to actually terminate after SIGKILL.
-                let kill_timeout = Duration::from_secs(2);
-                if !wait_for_exit(kill_timeout) {
+                    let errno = std::io::Error::last_os_error();
                     if let Some(c) = child.take() {
                         self.running_processes.insert(task_id.to_string(), c);
                     }
                     return Err(HyperVError::ProcessStop(format!(
-                        "Process {} did not terminate after SIGKILL",
+                        "Failed to kill process {} or its children (errno: {})",
+                        pid, errno
+                    )));
+                }
+
+                // Give it a chance to actually terminate after SIGKILL.
+                let kill_timeout = Duration::from_secs(2);
+                if !wait_for_exit(kill_timeout) || !all_stopped(&watched_pids, &watched_pgids) {
+                    if let Some(c) = child.take() {
+                        self.running_processes.insert(task_id.to_string(), c);
+                    }
+                    return Err(HyperVError::ProcessStop(format!(
+                        "Process {} or one of its children did not terminate after SIGKILL",
                         pid
                     )));
                 }

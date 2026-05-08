@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod unix {
-    use hyperV::process::ProcessManager;
     use hyperV::Task;
+    use hyperV::process::ProcessManager;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -20,7 +20,11 @@ mod unix {
         }
     }
 
-    fn write_executable_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    fn write_executable_script(
+        dir: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write script");
 
@@ -187,6 +191,83 @@ exit 0
         assert!(
             !pm.is_process_running(pid) && !pm.is_process_group_running(pid),
             "process/group should be stopped"
+        );
+    }
+
+    #[test]
+    fn stop_task_kills_child_in_separate_process_group() {
+        let dir = tempdir().expect("tempdir");
+        let stdout = dir.path().join("stdout.log");
+        let stderr = dir.path().join("stderr.log");
+        let child_pid_path = dir.path().join("child.pid");
+
+        let sleep_bin = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let python_bin = if std::path::Path::new("/usr/bin/python3").exists() {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let spawner = dir.path().join("spawn_session_child.py");
+        std::fs::write(
+            &spawner,
+            format!(
+                r#"import os
+import subprocess
+
+child = subprocess.Popen([{sleep_bin:?}, "60"], preexec_fn=os.setsid)
+with open({pid_path:?}, "w") as f:
+    f.write(str(child.pid))
+    f.flush()
+child.wait()
+"#,
+                sleep_bin = sleep_bin,
+                pid_path = child_pid_path.to_string_lossy(),
+            ),
+        )
+        .expect("write python spawner");
+
+        let mut pm = ProcessManager::new();
+        let task = Task::new(
+            "t6".to_string(),
+            "session-child".to_string(),
+            python_bin.to_string(),
+            vec![spawner.to_string_lossy().to_string()],
+            HashMap::new(),
+            Some(dir.path().to_string_lossy().to_string()),
+            false,
+            Some(stdout.to_string_lossy().to_string()),
+            Some(stderr.to_string_lossy().to_string()),
+        );
+
+        let pid = pm
+            .start_task(&task, &HashMap::new(), &stdout, &stderr)
+            .expect("start_task");
+        let _parent_guard = KillGroupOnDrop { pgid: pid };
+
+        assert!(
+            wait_until(Duration::from_secs(2), || child_pid_path.exists()),
+            "child pid file should be written"
+        );
+        let child_pid: u32 = std::fs::read_to_string(&child_pid_path)
+            .expect("read child pid")
+            .parse()
+            .expect("parse child pid");
+        let _child_guard = KillGroupOnDrop { pgid: child_pid };
+
+        assert!(
+            wait_until(Duration::from_secs(1), || pm.is_process_running(child_pid)),
+            "child should be running"
+        );
+
+        pm.stop_task(&task.id, pid).expect("stop_task");
+
+        assert!(
+            wait_until(Duration::from_secs(2), || !pm.is_process_running(child_pid)),
+            "child in separate process group should be stopped"
         );
     }
 
