@@ -11,6 +11,7 @@ A command-line service manager for running and managing binary files on Linux an
 - ✅ Custom working directories
 - ✅ Auto-restart configuration
 - ✅ Task status monitoring with detailed information
+- ✅ Restart command for running services
 - ✅ Cross-platform support (Linux & macOS)
 - ✅ Persistent task configuration
 - ✅ Process monitoring with PID tracking
@@ -19,10 +20,12 @@ A command-line service manager for running and managing binary files on Linux an
 - ✅ Real-time log following (--follow flag)
 - ✅ Separate stdout/stderr log viewing
 - ✅ Enhanced process management with signal handling
+- ✅ Process group and child-process cleanup on stop
 - ✅ Diagnostic tools for troubleshooting
 - ✅ Exit code tracking
 - ✅ Restart count monitoring
 - ✅ Persistent running-task state across hyperV restarts
+- ✅ Compose-style YAML workflow with `up` and `down`
 
 ## Installation
 
@@ -94,6 +97,16 @@ hyperV start abff48b0
 hyperV stop my-service
 ```
 
+`stop` sends SIGTERM first, then SIGKILL if the process does not exit in time. On Unix, hyperV also targets the task process group and known child process groups so helper scripts do not leave the real app running in the background.
+
+### Restart a task
+
+```bash
+hyperV restart my-service
+```
+
+`restart` stops the task if it is running, then starts it again.
+
 ### Show task status
 
 ```bash
@@ -139,6 +152,34 @@ hyperV logs my-service --log-type stderr --follow
 hyperV diagnose my-service
 ```
 
+### Compose-style workflow
+
+Define services in a YAML file, then create or update tasks from it:
+
+```bash
+# Uses hyperv.yaml by default
+hyperV up --start
+
+# Use a custom file
+hyperV up --file ./startup.yaml --start
+
+# Remove services defined in the YAML file
+hyperV down --file ./startup.yaml
+```
+
+YAML files use this shape:
+
+```yaml
+services:
+  worker:
+    binary: "/bin/bash"
+    args: ["./tests/worker.sh"]
+    workdir: "/path/to/app"
+    env:
+      NODE_ENV: "production"
+    auto_restart: true
+```
+
 ## Advanced Features
 
 ### Auto-restart
@@ -157,7 +198,7 @@ hyperV new --name "critical-service" --binary "/path/to/service" --auto-restart
 
 ### Process Management
 - Graceful shutdown with SIGTERM before SIGKILL
-- Process group handling for shell scripts
+- Process group handling for shell scripts and child processes
 - Proper cleanup of zombie processes
 - Exit code tracking
 
@@ -190,6 +231,10 @@ Runtime state (persisted running tasks) is stored in:
 - macOS: `~/Library/Application Support/hyperV/running_tasks.json`
 - Linux: `~/.config/hyperV/running_tasks.json`
 
+Daemon coordination state is stored in:
+- macOS: `~/Library/Application Support/hyperV/daemon.pid`
+- Linux: `~/.config/hyperV/daemon.pid`
+
 ## Task Structure
 
 Each task contains:
@@ -202,10 +247,12 @@ Each task contains:
 - `auto_restart`: Auto-restart on failure
 - `status`: Current status (Running/Stopped/Failed)
 - `pid`: Process ID when running
+- `pid_start_time`: Process identity timestamp used to reduce PID-reuse mistakes
 - `created_at`: Creation timestamp
 - `last_started`: Last start timestamp
 - `restart_count`: Number of automatic restarts
 - `last_exit_code`: Exit code from last run
+- `suppress_restart`: Internal flag that prevents an explicitly stopped task from being auto-restarted
 - `stdout_log_path`: Path to stdout log file
 - `stderr_log_path`: Path to stderr log file
 
@@ -325,16 +372,14 @@ Notes:
 - Ensure the surreal binary is available in PATH for the user running hyperV.
 - Alternatively, you can keep using the provided tests/surreal.sh wrapper if you prefer.
 
-## Future Enhancements
+## Potential Future Enhancements
 
-- [ ] Log file management and viewing
-- [ ] Process monitoring with automatic restart
-- [ ] Resource usage tracking
 - [ ] Systemd/launchd integration
 - [ ] Web UI for management
 - [ ] Task dependencies
 - [ ] Scheduling support
-- [ ] Better error handling and recovery
+- [ ] Richer CPU and resource usage reporting
+- [ ] More structured error reporting for automation
 
 ## License
 
