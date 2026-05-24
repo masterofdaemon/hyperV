@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use crate::logs::LogType;
+use clap::{Parser, Subcommand};
 
 /// hyperV CLI application
 #[derive(Parser)]
@@ -75,6 +75,9 @@ pub enum Commands {
         /// Follow logs in real-time (like tail -f)
         #[arg(short, long)]
         follow: bool,
+        /// Show a compact diagnostic summary instead of raw log lines
+        #[arg(long)]
+        summary: bool,
     },
     /// Diagnose binary file issues
     Diagnose {

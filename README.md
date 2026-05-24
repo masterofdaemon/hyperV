@@ -138,6 +138,9 @@ hyperV logs my-service --log-type stderr
 # Show both stdout and stderr
 hyperV logs my-service --log-type both
 
+# Show a compact diagnostic summary instead of raw lines
+hyperV logs my-service --log-type both --summary
+
 # Follow logs in real-time (like tail -f)
 hyperV logs my-service --follow
 
@@ -189,12 +192,28 @@ Tasks with `--auto-restart` flag will automatically restart if they fail (up to 
 hyperV new --name "critical-service" --binary "/path/to/service" --auto-restart
 ```
 
+### Telegram failure alerts
+The daemon can send Telegram messages when a service is in real trouble:
+- A task crashes 2 times within 10 minutes
+- A task exhausts all 5 auto-restart attempts
+
+Alerts are opt-in. Set both environment variables before starting tasks with auto-restart:
+
+```bash
+export HYPERV_TELEGRAM_BOT_TOKEN="123456:bot-token"
+export HYPERV_TELEGRAM_CHAT_ID="123456789"
+hyperV start critical-service
+```
+
+Alert messages include the task name, reason, restart count, last exit code, and detection time. They do not include environment variables, raw logs, or command-line arguments.
+
 ### Log Management
 - Logs are automatically rotated when they exceed 10MB
 - Separate stdout and stderr log files
 - Real-time log following capability
 - Fast last-N reading for tail-like views (reads from end of file efficiently)
-- Historical log preservation (.old files)
+- Compact summaries with counts, top repeated messages, recent warnings/errors, and redaction of obvious secret-like values
+- Historical log preservation as bounded gzip archives (`stdout.log.1.gz` through `stdout.log.5.gz`, and the same for stderr)
 
 ### Process Management
 - Graceful shutdown with SIGTERM before SIGKILL

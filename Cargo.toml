@@ -15,6 +15,8 @@ dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 sysinfo = { version = "0.30" }
 fs2 = "0.4"
+flate2 = "1.0"
+ureq = "2.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

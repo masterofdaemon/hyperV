@@ -591,6 +591,7 @@ impl TaskManager {
         lines: usize,
         log_type: LogType,
         follow: bool,
+        summary: bool,
     ) -> Result<()> {
         let task = self
             .find_task(identifier)
@@ -599,7 +600,7 @@ impl TaskManager {
         let stdout_path = self.config.stdout_log_path(&task.id);
         let stderr_path = self.config.stderr_log_path(&task.id);
 
-        LogManager::show_logs(&stdout_path, &stderr_path, log_type, lines, follow)
+        LogManager::show_logs(&stdout_path, &stderr_path, log_type, lines, follow, summary)
     }
 
     /// Diagnose a task's binary
@@ -729,6 +730,11 @@ impl TaskManager {
             .count()
     }
 
+    /// Read-only view of configured tasks.
+    pub fn tasks(&self) -> &[Task] {
+        &self.tasks
+    }
+
     /// Get the number of tasks with auto-restart enabled
     pub fn tasks_with_autorestart_count(&self) -> usize {
         self.tasks.iter().filter(|t| t.auto_restart).count()
@@ -736,6 +742,11 @@ impl TaskManager {
 
     /// Clean up zombie processes and update task states
     pub fn cleanup(&mut self) -> Result<()> {
+        self.cleanup_with_events().map(|_| ())
+    }
+
+    /// Clean up zombie processes, update task states, and return tasks that failed in this pass.
+    pub fn cleanup_with_events(&mut self) -> Result<Vec<Task>> {
         // Reload tasks from disk to incorporate external updates (e.g., stop suppression)
         if let Ok(content) = fs::read_to_string(&self.config.tasks_file)
             && let Ok(tasks_on_disk) = serde_json::from_str::<Vec<Task>>(&content)
@@ -747,6 +758,7 @@ impl TaskManager {
 
         // Update task states for processes that are no longer running
         let mut changed = false;
+        let mut failed_tasks = Vec::new();
         for task in &mut self.tasks {
             if task.status == TaskStatus::Running
                 && let Some(pid) = task.pid
@@ -768,6 +780,7 @@ impl TaskManager {
 
                     task.set_status(TaskStatus::Failed);
                     task.clear_pid();
+                    failed_tasks.push(task.clone());
                     changed = true;
                 } else if pid_running && task.pid_start_time.is_none() {
                     task.set_pid_start_time(self.process_manager.process_start_time(pid));
@@ -781,7 +794,7 @@ impl TaskManager {
             self.save_running_tasks()?;
         }
 
-        Ok(())
+        Ok(failed_tasks)
     }
 
     /// Whether any task has auto-restart enabled

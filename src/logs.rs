@@ -2,11 +2,16 @@
 //!
 //! Handles log file rotation, reading, and real-time following functionality.
 
-use crate::constants::{LOG_FOLLOW_INTERVAL, MAX_LOG_SIZE};
+use crate::constants::{LOG_FOLLOW_INTERVAL, MAX_LOG_ARCHIVES, MAX_LOG_SIZE};
 use crate::error::{HyperVError, Result};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 /// Types of logs that can be viewed
@@ -43,22 +48,56 @@ impl LogManager {
         let metadata = fs::metadata(log_path).map_err(HyperVError::Io)?;
 
         if metadata.len() > MAX_LOG_SIZE {
-            let backup_path = log_path.with_extension("log.old");
-
-            // Remove old backup if it exists
-            if backup_path.exists() {
-                fs::remove_file(&backup_path).map_err(HyperVError::Io)?;
-            }
-
-            // Move current log to backup
-            fs::rename(log_path, &backup_path).map_err(HyperVError::Io)?;
+            Self::rotate_archives(log_path)?;
+            let archive_path = Self::archive_path(log_path, 1)?;
+            Self::compress_log_to_archive(log_path, &archive_path)?;
+            fs::remove_file(log_path).map_err(HyperVError::Io)?;
 
             println!(
                 "📦 Rotated log file: {} -> {}",
                 log_path.display(),
-                backup_path.display()
+                archive_path.display()
             );
         }
+
+        Ok(())
+    }
+
+    fn rotate_archives(log_path: &Path) -> Result<()> {
+        let oldest_archive = Self::archive_path(log_path, MAX_LOG_ARCHIVES)?;
+        if oldest_archive.exists() {
+            fs::remove_file(&oldest_archive).map_err(HyperVError::Io)?;
+        }
+
+        for archive_index in (1..MAX_LOG_ARCHIVES).rev() {
+            let source = Self::archive_path(log_path, archive_index)?;
+            if source.exists() {
+                let destination = Self::archive_path(log_path, archive_index + 1)?;
+                fs::rename(source, destination).map_err(HyperVError::Io)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn archive_path(log_path: &Path, archive_index: usize) -> Result<PathBuf> {
+        let file_name = log_path
+            .file_name()
+            .ok_or_else(|| HyperVError::LogError("Log path has no file name".to_string()))?
+            .to_string_lossy();
+
+        Ok(log_path.with_file_name(format!("{file_name}.{archive_index}.gz")))
+    }
+
+    fn compress_log_to_archive(log_path: &Path, archive_path: &Path) -> Result<()> {
+        let mut input = File::open(log_path).map_err(HyperVError::Io)?;
+        let temp_archive = archive_path.with_extension("gz.tmp");
+        let output = File::create(&temp_archive).map_err(HyperVError::Io)?;
+        let mut encoder = GzEncoder::new(output, Compression::default());
+
+        std::io::copy(&mut input, &mut encoder).map_err(HyperVError::Io)?;
+        encoder.finish().map_err(HyperVError::Io)?;
+        fs::rename(temp_archive, archive_path).map_err(HyperVError::Io)?;
 
         Ok(())
     }
@@ -123,7 +162,14 @@ impl LogManager {
         log_type: LogType,
         lines: usize,
         follow: bool,
+        summary: bool,
     ) -> Result<()> {
+        if summary {
+            let summary = Self::summarize_logs(stdout_path, stderr_path, log_type)?;
+            print!("{}", summary.format());
+            return Ok(());
+        }
+
         match log_type {
             LogType::Stdout => {
                 Self::show_single_log(stdout_path, "STDOUT", lines, follow)?;
@@ -148,6 +194,101 @@ impl LogManager {
                     println!("\n=== Following logs (Ctrl+C to stop) ===");
                     Self::follow_both_logs(stdout_path, stderr_path)?;
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Summarize selected logs without dumping full log content.
+    pub fn summarize_logs(
+        stdout_path: &Path,
+        stderr_path: &Path,
+        log_type: LogType,
+    ) -> Result<LogSummary> {
+        let mut summary = LogSummary::default();
+
+        match log_type {
+            LogType::Stdout => Self::summarize_log_family(stdout_path, "STDOUT", &mut summary)?,
+            LogType::Stderr => Self::summarize_log_family(stderr_path, "STDERR", &mut summary)?,
+            LogType::Both => {
+                Self::summarize_log_family(stdout_path, "STDOUT", &mut summary)?;
+                Self::summarize_log_family(stderr_path, "STDERR", &mut summary)?;
+            }
+        }
+
+        summary.finalize();
+        Ok(summary)
+    }
+
+    fn summarize_log_family(
+        log_path: &Path,
+        log_name: &str,
+        summary: &mut LogSummary,
+    ) -> Result<()> {
+        let before_lines = summary.total_lines;
+        let before_bytes = summary.total_bytes;
+
+        if log_path.exists() {
+            let metadata = fs::metadata(log_path).map_err(HyperVError::Io)?;
+            summary.total_bytes += metadata.len();
+            let file = File::open(log_path).map_err(HyperVError::Io)?;
+            Self::summarize_reader(BufReader::new(file), log_name, false, summary)?;
+        }
+
+        for archive_index in 1..=MAX_LOG_ARCHIVES {
+            let archive_path = Self::archive_path(log_path, archive_index)?;
+            if !archive_path.exists() {
+                continue;
+            }
+
+            let metadata = fs::metadata(&archive_path).map_err(HyperVError::Io)?;
+            summary.total_bytes += metadata.len();
+            summary.archive_count += 1;
+
+            let file = File::open(&archive_path).map_err(HyperVError::Io)?;
+            let decoder = GzDecoder::new(file);
+            Self::summarize_reader(BufReader::new(decoder), log_name, true, summary)?;
+        }
+
+        summary.files.push(LogFileSummary {
+            name: log_name.to_string(),
+            path: log_path.to_string_lossy().to_string(),
+            exists: log_path.exists(),
+            lines: summary.total_lines - before_lines,
+            bytes: summary.total_bytes - before_bytes,
+        });
+
+        Ok(())
+    }
+
+    fn summarize_reader<R: BufRead>(
+        reader: R,
+        log_name: &str,
+        archived: bool,
+        summary: &mut LogSummary,
+    ) -> Result<()> {
+        for line_result in reader.lines() {
+            let line = line_result.map_err(HyperVError::Io)?;
+            summary.total_lines += 1;
+
+            let event = LogEvent::from_line(log_name, archived, &line);
+            let message = event.message.clone();
+            *summary.message_counts.entry(message).or_insert(0) += 1;
+
+            match event.level {
+                LogLevel::Error => {
+                    summary.error_count += 1;
+                    summary.recent_events.push(event);
+                }
+                LogLevel::Warn => {
+                    summary.warning_count += 1;
+                    summary.recent_events.push(event);
+                }
+                LogLevel::Info => {
+                    summary.info_count += 1;
+                }
+                LogLevel::Other => {}
             }
         }
 
@@ -353,6 +494,233 @@ impl LogManager {
             size: metadata.len(),
             line_count,
         })
+    }
+}
+
+/// Compact diagnostic summary for one `hyperV logs --summary` invocation.
+#[derive(Debug, Default)]
+pub struct LogSummary {
+    pub total_lines: usize,
+    pub total_bytes: u64,
+    pub archive_count: usize,
+    pub info_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub files: Vec<LogFileSummary>,
+    top_messages: Vec<(usize, String)>,
+    recent_events: Vec<LogEvent>,
+    message_counts: HashMap<String, usize>,
+}
+
+impl LogSummary {
+    fn finalize(&mut self) {
+        let mut top_messages: Vec<(usize, String)> = self
+            .message_counts
+            .iter()
+            .map(|(message, count)| (*count, message.clone()))
+            .collect();
+        top_messages.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        top_messages.truncate(8);
+        self.top_messages = top_messages;
+
+        let recent_start = self.recent_events.len().saturating_sub(10);
+        self.recent_events = self.recent_events.split_off(recent_start);
+    }
+
+    pub fn format(&self) -> String {
+        let mut output = String::new();
+
+        output.push_str("=== LOG SUMMARY ===\n");
+        output.push_str(&format!("Total lines: {}\n", self.total_lines));
+        output.push_str(&format!("Total size: {}\n", format_bytes(self.total_bytes)));
+        output.push_str(&format!("Archives scanned: {}\n", self.archive_count));
+        output.push_str(&format!(
+            "Levels: error={} warn={} info={} other={}\n",
+            self.error_count,
+            self.warning_count,
+            self.info_count,
+            self.total_lines
+                .saturating_sub(self.error_count + self.warning_count + self.info_count)
+        ));
+
+        output.push_str("\nFiles:\n");
+        for file in &self.files {
+            let state = if file.exists { "present" } else { "missing" };
+            output.push_str(&format!(
+                "- {}: {} lines, {}, {} ({})\n",
+                file.name,
+                file.lines,
+                format_bytes(file.bytes),
+                state,
+                file.path
+            ));
+        }
+
+        output.push_str("\nTop repeated messages:\n");
+        if self.top_messages.is_empty() {
+            output.push_str("- none\n");
+        } else {
+            for (count, message) in &self.top_messages {
+                output.push_str(&format!("- {}x {}\n", count, message));
+            }
+        }
+
+        output.push_str("\nRecent warnings/errors:\n");
+        if self.recent_events.is_empty() {
+            output.push_str("- none\n");
+        } else {
+            for event in &self.recent_events {
+                let archive_marker = if event.archived { " archived" } else { "" };
+                output.push_str(&format!(
+                    "- [{}{}] {} {}\n",
+                    event.source, archive_marker, event.level, event.message
+                ));
+            }
+        }
+
+        output
+    }
+}
+
+#[derive(Debug)]
+pub struct LogFileSummary {
+    pub name: String,
+    pub path: String,
+    pub exists: bool,
+    pub lines: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Other,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Error => write!(f, "ERROR"),
+            LogLevel::Warn => write!(f, "WARN"),
+            LogLevel::Info => write!(f, "INFO"),
+            LogLevel::Other => write!(f, "OTHER"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LogEvent {
+    source: String,
+    archived: bool,
+    level: LogLevel,
+    message: String,
+}
+
+impl LogEvent {
+    fn from_line(source: &str, archived: bool, line: &str) -> Self {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            let level = value
+                .get("level")
+                .and_then(Value::as_str)
+                .map(parse_level)
+                .unwrap_or(LogLevel::Other);
+            let message = value.get("msg").and_then(Value::as_str).unwrap_or(line);
+
+            return Self {
+                source: source.to_string(),
+                archived,
+                level,
+                message: sanitize_message(message),
+            };
+        }
+
+        Self {
+            source: source.to_string(),
+            archived,
+            level: parse_level(line),
+            message: sanitize_message(line),
+        }
+    }
+}
+
+fn parse_level(input: &str) -> LogLevel {
+    match input.to_ascii_uppercase().as_str() {
+        "ERROR" => LogLevel::Error,
+        "WARN" | "WARNING" => LogLevel::Warn,
+        "INFO" => LogLevel::Info,
+        value if value.contains("ERROR") || value.contains("PANIC") || value.contains("FAIL") => {
+            LogLevel::Error
+        }
+        value if value.contains("WARN") => LogLevel::Warn,
+        value if value.contains("INFO") => LogLevel::Info,
+        _ => LogLevel::Other,
+    }
+}
+
+fn sanitize_message(message: &str) -> String {
+    let redacted = redact_sensitive_values(message);
+    if redacted.chars().count() > 300 {
+        format!("{}...", redacted.chars().take(300).collect::<String>())
+    } else {
+        redacted
+    }
+}
+
+fn redact_sensitive_values(input: &str) -> String {
+    let mut output = input.to_string();
+    for key in [
+        "api_key", "apikey", "password", "passwd", "secret", "token", "key",
+    ] {
+        output = redact_key_assignments(&output, key);
+    }
+    output
+}
+
+fn redact_key_assignments(input: &str, key: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let lower = input.to_ascii_lowercase();
+    let mut cursor = 0;
+
+    while let Some(relative_pos) = lower[cursor..].find(key) {
+        let key_start = cursor + relative_pos;
+        let key_end = key_start + key.len();
+        let Some(separator) = input[key_end..].chars().next() else {
+            break;
+        };
+
+        if separator != '=' && separator != ':' {
+            output.push_str(&input[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
+
+        let value_start = key_end + separator.len_utf8();
+        output.push_str(&input[cursor..value_start]);
+        output.push_str("[REDACTED]");
+
+        let mut value_end = value_start;
+        for (offset, ch) in input[value_start..].char_indices() {
+            if ch.is_whitespace() || matches!(ch, ',' | ';' | '&' | '"' | '\'' | '}') {
+                break;
+            }
+            value_end = value_start + offset + ch.len_utf8();
+        }
+        cursor = value_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
