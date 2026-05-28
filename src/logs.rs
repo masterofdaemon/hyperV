@@ -626,7 +626,11 @@ impl LogEvent {
                 .and_then(Value::as_str)
                 .map(parse_level)
                 .unwrap_or(LogLevel::Other);
-            let message = value.get("msg").and_then(Value::as_str).unwrap_or(line);
+            let message = value
+                .get("msg")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or(line);
 
             return Self {
                 source: source.to_string(),
@@ -668,11 +672,23 @@ fn sanitize_message(message: &str) -> String {
     }
 }
 
+const SENSITIVE_REDACTION_KEYS: [&str; 11] = [
+    "secret_token",
+    "access_token",
+    "auth_token",
+    "api_token",
+    "password",
+    "api_key",
+    "apikey",
+    "passwd",
+    "secret",
+    "token",
+    "key",
+];
+
 fn redact_sensitive_values(input: &str) -> String {
     let mut output = input.to_string();
-    for key in [
-        "api_key", "apikey", "password", "passwd", "secret", "token", "key",
-    ] {
+    for key in SENSITIVE_REDACTION_KEYS {
         output = redact_key_assignments(&output, key);
     }
     output
@@ -686,6 +702,11 @@ fn redact_key_assignments(input: &str, key: &str) -> String {
     while let Some(relative_pos) = lower[cursor..].find(key) {
         let key_start = cursor + relative_pos;
         let key_end = key_start + key.len();
+        if !is_redaction_key_boundary(input, key_start) {
+            output.push_str(&input[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
         let Some(separator) = input[key_end..].chars().next() else {
             break;
         };
@@ -712,6 +733,42 @@ fn redact_key_assignments(input: &str, key: &str) -> String {
 
     output.push_str(&input[cursor..]);
     output
+}
+
+fn is_redaction_key_boundary(input: &str, key_start: usize) -> bool {
+    if key_start == 0 {
+        return true;
+    }
+
+    input[..key_start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_longer_sensitive_keys_before_prefix_keys() {
+        let sanitized = sanitize_message("secret_token=abc123 secret=def456 monkey=banana");
+
+        assert!(sanitized.contains("secret_token=[REDACTED]"));
+        assert!(sanitized.contains("secret=[REDACTED]"));
+        assert!(sanitized.contains("monkey=banana"));
+        assert!(!sanitized.contains("abc123"));
+        assert!(!sanitized.contains("def456"));
+    }
+
+    #[test]
+    fn sensitive_redaction_keys_are_longest_first() {
+        assert!(
+            SENSITIVE_REDACTION_KEYS
+                .windows(2)
+                .all(|keys| keys[0].len() >= keys[1].len())
+        );
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
