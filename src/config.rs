@@ -1,5 +1,5 @@
 //! Configuration management for hyperV
-//! 
+//!
 //! Handles configuration directory setup, file paths, and persistent storage.
 
 use crate::error::{HyperVError, Result};
@@ -25,7 +25,9 @@ impl Config {
             PathBuf::from(val)
         } else {
             dirs::config_dir()
-                .ok_or(HyperVError::Config("Could not find config directory".to_string()))?
+                .ok_or(HyperVError::Config(
+                    "Could not find config directory".to_string(),
+                ))?
                 .join("hyperV")
         };
 
@@ -34,10 +36,8 @@ impl Config {
         let logs_dir = config_dir.join("logs");
 
         // Create directories if they don't exist
-        fs::create_dir_all(&config_dir)
-            .map_err(HyperVError::Io)?;
-        fs::create_dir_all(&logs_dir)
-            .map_err(HyperVError::Io)?;
+        fs::create_dir_all(&config_dir).map_err(HyperVError::Io)?;
+        fs::create_dir_all(&logs_dir).map_err(HyperVError::Io)?;
 
         Ok(Config {
             config_dir,
@@ -65,8 +65,7 @@ impl Config {
     /// Ensure task log directory exists
     pub fn ensure_task_log_dir(&self, task_id: &str) -> Result<()> {
         let dir = self.task_log_dir(task_id);
-        fs::create_dir_all(&dir)
-            .map_err(HyperVError::Io)?;
+        fs::create_dir_all(&dir).map_err(HyperVError::Io)?;
         Ok(())
     }
 

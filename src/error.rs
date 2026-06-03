@@ -11,7 +11,7 @@ pub enum HyperVError {
     TaskNotFound(String),
     /// Configuration error
     Config(String),
-    
+
     /// Task already exists
     TaskAlreadyExists(String),
     /// Task exists
@@ -59,21 +59,31 @@ impl fmt::Display for HyperVError {
             HyperVError::TaskAlreadyExists(name) => write!(f, "Task '{}' already exists", name),
             HyperVError::Config(msg) => write!(f, "Configuration error: {}", msg),
             HyperVError::TaskExists(name) => write!(f, "Task '{}' already exists", name),
-            HyperVError::TaskAlreadyRunning(name) => write!(f, "Task '{}' is already running", name),
+            HyperVError::TaskAlreadyRunning(name) => {
+                write!(f, "Task '{}' is already running", name)
+            }
             HyperVError::TaskNotRunning(name) => write!(f, "Task '{}' is not running", name),
             HyperVError::ProcessError(msg) => write!(f, "Process error: {}", msg),
             HyperVError::ConfigError(msg) => write!(f, "Configuration error: {}", msg),
             HyperVError::LogError(msg) => write!(f, "Log error: {}", msg),
             HyperVError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             HyperVError::WorkdirNotFound(dir) => write!(f, "Working directory not found: {}", dir),
-            HyperVError::InvalidEnvVar(var) => write!(f, "Invalid environment variable format: {}", var),
+            HyperVError::InvalidEnvVar(var) => {
+                write!(f, "Invalid environment variable format: {}", var)
+            }
             HyperVError::InvalidLogType(log_type) => write!(f, "Invalid log type: {}", log_type),
             HyperVError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
-            HyperVError::ProcessStart(binary, msg) => write!(f, "Failed to start process '{}': {}", binary, msg),
+            HyperVError::ProcessStart(binary, msg) => {
+                write!(f, "Failed to start process '{}': {}", binary, msg)
+            }
             HyperVError::ProcessStop(msg) => write!(f, "Failed to stop process: {}", msg),
             HyperVError::BinaryNotFound(binary) => write!(f, "Binary not found: {}", binary),
-            HyperVError::BinaryNotExecutable(binary) => write!(f, "Binary not executable: {}", binary),
-            HyperVError::InterpreterNotFound(interpreter) => write!(f, "Interpreter not found: {}", interpreter),
+            HyperVError::BinaryNotExecutable(binary) => {
+                write!(f, "Binary not executable: {}", binary)
+            }
+            HyperVError::InterpreterNotFound(interpreter) => {
+                write!(f, "Interpreter not found: {}", interpreter)
+            }
             HyperVError::InvalidBinary(msg) => write!(f, "Invalid binary: {}", msg),
         }
     }
