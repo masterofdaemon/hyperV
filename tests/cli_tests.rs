@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn hyperv_cmd(temp_dir: &TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("hyperV").unwrap();
+    let mut cmd = Command::cargo_bin("hyperv").unwrap();
     cmd.env("HYPERV_CONFIG_DIR", temp_dir.path());
     cmd
 }
@@ -251,7 +251,7 @@ fn test_restart_command() {
 #[test]
 fn test_daemon_locking() {
     let temp = TempDir::new().unwrap();
-    let bin_path = assert_cmd::cargo::cargo_bin("hyperV");
+    let bin_path = assert_cmd::cargo::cargo_bin("hyperv");
 
     // Kills the daemon on every exit path, including an assertion panic.
     struct Reaper(std::process::Child);

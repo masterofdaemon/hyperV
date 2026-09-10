@@ -116,12 +116,21 @@ impl LogManager {
             return Ok(Vec::new());
         }
 
-        let mut result_lines = Vec::new();
-        let mut buffer = Vec::new();
+        if lines == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Read the file from the end in chunks, storing each chunk separately.
+        // (Prepending each chunk with `buffer.splice(0..0, ...)` shifted the
+        // whole buffer every time, which is O(n²) for large files. Collecting
+        // chunks and concatenating once at the end is O(n).)
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut newline_count: usize = 0;
         let mut current_pos = file_size;
 
-        // Read the file from the end in chunks
-        while current_pos > 0 && result_lines.len() < lines {
+        // Read until we hold more than enough newlines for `lines`
+        // (one extra in case the buffer starts mid-line), or we reach BOF.
+        while current_pos > 0 && newline_count <= lines {
             let chunk_size = std::cmp::min(current_pos, 4096);
             current_pos -= chunk_size;
             reader
@@ -129,30 +138,25 @@ impl LogManager {
                 .map_err(HyperVError::Io)?;
             let mut chunk = vec![0; chunk_size as usize];
             reader.read_exact(&mut chunk).map_err(HyperVError::Io)?;
-
-            // Prepend the chunk to our buffer
-            buffer.splice(0..0, chunk.iter().cloned());
-
-            // Process the buffer to find lines
-            while let Some(newline_pos) = buffer.iter().rposition(|&b| b == b'\n') {
-                let line_bytes = buffer.split_off(newline_pos + 1);
-                if !line_bytes.is_empty() {
-                    result_lines.push(String::from_utf8_lossy(&line_bytes).trim_end().to_string());
-                    if result_lines.len() >= lines {
-                        break;
-                    }
-                }
-                buffer.pop(); // Remove the newline character
-            }
+            newline_count += chunk.iter().filter(|&&b| b == b'\n').count();
+            chunks.push(chunk);
         }
 
-        // Add the remaining buffer as the first line
-        if !buffer.is_empty() && result_lines.len() < lines {
-            result_lines.push(String::from_utf8_lossy(&buffer).trim_end().to_string());
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buffer = Vec::with_capacity(total_len);
+        for chunk in chunks.iter().rev() {
+            buffer.extend_from_slice(chunk);
         }
 
-        result_lines.reverse();
-        Ok(result_lines)
+        let text = String::from_utf8_lossy(&buffer);
+        // `str::lines` drops the phantom empty line from a trailing newline,
+        // matching the previous split_off/pop behavior.
+        let all: Vec<String> = text
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        let start = all.len().saturating_sub(lines);
+        Ok(all[start..].to_vec())
     }
 
     /// Show logs for a task
@@ -179,13 +183,17 @@ impl LogManager {
             }
             LogType::Both => {
                 println!("=== STDOUT ===");
-                let stdout_lines = Self::read_log_lines(stdout_path, lines / 2)?;
+                // Split so the two sides add up to `lines` (stdout gets the
+                // extra line when `lines` is odd) instead of dropping one.
+                let stdout_count = lines.div_ceil(2);
+                let stderr_count = lines / 2;
+                let stdout_lines = Self::read_log_lines(stdout_path, stdout_count)?;
                 for line in stdout_lines {
                     println!("{}", line);
                 }
 
                 println!("\n=== STDERR ===");
-                let stderr_lines = Self::read_log_lines(stderr_path, lines / 2)?;
+                let stderr_lines = Self::read_log_lines(stderr_path, stderr_count)?;
                 for line in stderr_lines {
                     println!("{}", line);
                 }

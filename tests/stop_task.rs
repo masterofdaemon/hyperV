@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod unix {
-    use hyperV::Task;
-    use hyperV::process::ProcessManager;
+    use hyperv::Task;
+    use hyperv::process::ProcessManager;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;

@@ -3,8 +3,6 @@
 //! A command-line service manager for running and managing binary files
 //! on Linux and macOS with advanced process management, logging, and monitoring.
 
-#![allow(non_snake_case)]
-
 pub mod alerts;
 pub mod cli;
 pub mod compose;
