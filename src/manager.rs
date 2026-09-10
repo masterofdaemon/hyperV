@@ -38,16 +38,15 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
-    fn get_process_memory_mb(sys: &mut System, pid: u32) -> u64 {
-        let pid = Pid::from_u32(pid);
-        if let Some(proc_) = sys.process(pid) {
-            // memory() returns bytes in sysinfo 0.30. Floor division truncates any
-            // process under 1 MiB RSS to 0, indistinguishable from "not running" -
-            // round up so a live process always shows at least 1 MB.
-            let bytes = proc_.memory();
-            return bytes.div_ceil(1024 * 1024);
-        }
-        0
+    fn get_process_memory_mb(sys: &System, pid: u32) -> u64 {
+        // tree_pids returns nothing when the root is absent. Sum RSS bytes before
+        // rounding so each process does not add its own partial MiB.
+        ProcessManager::tree_pids(sys, pid)
+            .into_iter()
+            .filter_map(|pid| sys.process(Pid::from_u32(pid)))
+            .map(|process| process.memory())
+            .sum::<u64>()
+            .div_ceil(1024 * 1024)
     }
 
     fn tasks_lock_file(&self) -> Result<fs::File> {
@@ -297,7 +296,7 @@ impl TaskManager {
             let status_display = task.status.display_with_icon();
             // Memory usage in MB if running
             let mem_mb = if let (TaskStatus::Running, Some(pid)) = (&task.status, task.pid) {
-                Self::get_process_memory_mb(&mut sys, pid)
+                Self::get_process_memory_mb(&sys, pid)
             } else {
                 0
             };
@@ -918,6 +917,106 @@ fn middle_ellipsis(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_sums_descendants_and_process_group_once() {
+        use std::collections::HashSet;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        struct Processes {
+            children: Vec<Child>,
+            groups: Vec<u32>,
+        }
+        impl Drop for Processes {
+            fn drop(&mut self) {
+                for pgid in &self.groups {
+                    unsafe { libc::kill(-(*pgid as i32), libc::SIGKILL) };
+                }
+                for child in &mut self.children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // Job control puts the child shell and grandchild in a separate group:
+        // they must be found through parents, even though PGID matching fails.
+        let root = Command::new("/bin/bash")
+            .args([
+                "-c",
+                "set -m; sh -c 'sleep 60 & echo \"$$ $!\"; wait' & wait",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let root_pid = root.id();
+        let mut processes = Processes {
+            children: vec![root],
+            groups: vec![root_pid],
+        };
+        let mut line = String::new();
+        BufReader::new(processes.children[0].stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendants: Vec<u32> = line
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        processes.groups.push(descendants[0]);
+        assert_eq!(descendants.len(), 2);
+
+        // This sibling shares the root's group but is not its descendant.
+        for pgid in [root_pid, 0] {
+            let child = Command::new("sleep")
+                .arg("60")
+                .process_group(pgid as i32)
+                .spawn()
+                .unwrap();
+            processes.children.push(child);
+        }
+        let peer_pid = processes.children[1].id();
+        let flat_pid = processes.children[2].id();
+        let expected = HashSet::from([root_pid, descendants[0], descendants[1], peer_pid]);
+        let mut sys = System::new();
+        sys.refresh_processes();
+        let actual = ProcessManager::tree_pids(&sys, root_pid);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "each PID must be counted once"
+        );
+        assert_eq!(actual.into_iter().collect::<HashSet<_>>(), expected);
+        let bytes: u64 = expected
+            .iter()
+            .map(|pid| sys.process(Pid::from_u32(*pid)).unwrap().memory())
+            .sum();
+        assert!(bytes > sys.process(Pid::from_u32(root_pid)).unwrap().memory());
+        assert_eq!(
+            TaskManager::get_process_memory_mb(&sys, root_pid),
+            bytes.div_ceil(1024 * 1024)
+        );
+        assert_eq!(ProcessManager::tree_pids(&sys, flat_pid), vec![flat_pid]);
+        assert_eq!(
+            TaskManager::get_process_memory_mb(&sys, flat_pid),
+            sys.process(Pid::from_u32(flat_pid))
+                .unwrap()
+                .memory()
+                .div_ceil(1024 * 1024)
+        );
+        assert_eq!(
+            TaskManager::get_process_memory_mb(&System::new(), root_pid),
+            0
+        );
+
+        // Let both shells reap their children on the normal path.
+        unsafe { libc::kill(descendants[1] as i32, libc::SIGTERM) };
+        processes.children[0].wait().unwrap();
+        processes.groups.clear();
+    }
 
     #[test]
     fn started_display_handles_boundaries_and_invalid_dates() {

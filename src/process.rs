@@ -5,9 +5,7 @@
 use crate::constants::SHUTDOWN_TIMEOUT;
 use crate::error::{HyperVError, Result};
 use crate::task::Task;
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -118,6 +116,35 @@ impl ProcessManager {
         }
 
         descendants
+    }
+
+    /// Root, descendants, and same-group processes from an existing snapshot.
+    pub(crate) fn tree_pids(system: &sysinfo::System, root_pid: u32) -> Vec<u32> {
+        let root = sysinfo::Pid::from_u32(root_pid);
+        if system.process(root).is_none() {
+            return Vec::new();
+        }
+
+        let mut pids = HashSet::from([root]);
+        let mut stack = vec![root];
+        while let Some(parent) = stack.pop() {
+            for (pid, process) in system.processes() {
+                if process.parent() == Some(parent) && pids.insert(*pid) {
+                    stack.push(*pid);
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        if let Some(pgid) = Self::process_group_id(root_pid) {
+            for pid in system.processes().keys() {
+                if Self::process_group_id(pid.as_u32()) == Some(pgid) {
+                    pids.insert(*pid);
+                }
+            }
+        }
+
+        pids.into_iter().map(|pid| pid.as_u32()).collect()
     }
 
     /// Check if a process with the given PID is running
