@@ -205,8 +205,17 @@ impl TaskManager {
         workdir: Option<String>,
         auto_restart: bool,
     ) -> Result<()> {
+        // Parse CLI KEY=VALUE vars here so the internal path works with maps.
+        let mut env = HashMap::with_capacity(env_vars.len());
+        for env_var in env_vars {
+            if let Some((key, value)) = env_var.split_once('=') {
+                env.insert(key.to_string(), value.to_string());
+            } else {
+                return Err(HyperVError::InvalidEnvVar(env_var));
+            }
+        }
         let _lock_file = self.lock_tasks_for_update()?;
-        self.create_task_unlocked(name, binary, args, env_vars, workdir, auto_restart)
+        self.create_task_unlocked(name, binary, args, env, workdir, auto_restart)
     }
 
     pub(crate) fn create_task_unlocked(
@@ -214,23 +223,13 @@ impl TaskManager {
         name: String,
         binary: String,
         args: Vec<String>,
-        env_vars: Vec<String>,
+        mut env: HashMap<String, String>,
         workdir: Option<String>,
         auto_restart: bool,
     ) -> Result<()> {
         // Check if task name already exists
         if self.tasks.iter().any(|t| t.name == name) {
             return Err(HyperVError::TaskExists(name));
-        }
-
-        // Parse environment variables from command line
-        let mut env = HashMap::new();
-        for env_var in env_vars {
-            if let Some((key, value)) = env_var.split_once('=') {
-                env.insert(key.to_string(), value.to_string());
-            } else {
-                return Err(HyperVError::InvalidEnvVar(env_var));
-            }
         }
 
         // Load environment variables from .env file in workdir

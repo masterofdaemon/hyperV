@@ -246,8 +246,10 @@ fn is_daemon_running() -> bool {
                 return true;
             }
         }
-        // If file exists but we can't open it? Assume running or permission error.
-        false
+        // If the file exists but we can't open it, assume a daemon is running:
+        // failing open is most likely a permission/lock-state issue, and
+        // assuming "not running" here would risk spawning a duplicate daemon.
+        true
     } else {
         false
     }

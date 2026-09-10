@@ -13,8 +13,6 @@ pub enum HyperVError {
     Config(String),
 
     /// Task already exists
-    TaskAlreadyExists(String),
-    /// Task exists
     TaskExists(String),
     /// Task already running
     TaskAlreadyRunning(String),
@@ -22,8 +20,6 @@ pub enum HyperVError {
     TaskNotRunning(String),
     /// Process operation failed
     ProcessError(String),
-    /// Configuration error
-    ConfigError(String),
     /// Log operation failed
     LogError(String),
     /// Invalid input provided
@@ -56,7 +52,6 @@ impl fmt::Display for HyperVError {
             HyperVError::Io(err) => write!(f, "I/O error: {}", err),
             HyperVError::Json(err) => write!(f, "JSON error: {}", err),
             HyperVError::TaskNotFound(name) => write!(f, "Task '{}' not found", name),
-            HyperVError::TaskAlreadyExists(name) => write!(f, "Task '{}' already exists", name),
             HyperVError::Config(msg) => write!(f, "Configuration error: {}", msg),
             HyperVError::TaskExists(name) => write!(f, "Task '{}' already exists", name),
             HyperVError::TaskAlreadyRunning(name) => {
@@ -64,7 +59,6 @@ impl fmt::Display for HyperVError {
             }
             HyperVError::TaskNotRunning(name) => write!(f, "Task '{}' is not running", name),
             HyperVError::ProcessError(msg) => write!(f, "Process error: {}", msg),
-            HyperVError::ConfigError(msg) => write!(f, "Configuration error: {}", msg),
             HyperVError::LogError(msg) => write!(f, "Log error: {}", msg),
             HyperVError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             HyperVError::WorkdirNotFound(dir) => write!(f, "Working directory not found: {}", dir),

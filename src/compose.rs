@@ -127,13 +127,6 @@ impl TaskManager {
         let _lock_file = self.lock_tasks_for_update()?;
         // Create or update tasks for each service
         for (name, svc) in &compose.services {
-            // Convert env map to vec of KEY=VALUE like CLI create expects
-            let env_vars: Vec<String> = svc
-                .env
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-
             // If task exists, replace its configuration; otherwise create
             if self
                 .find_task(name)?
@@ -152,7 +145,7 @@ impl TaskManager {
                     name.clone(),
                     svc.binary.clone(),
                     svc.args.clone(),
-                    env_vars,
+                    svc.env.clone(),
                     svc.workdir.clone(),
                     svc.auto_restart,
                 )?;

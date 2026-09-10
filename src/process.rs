@@ -36,7 +36,12 @@ impl ProcessManager {
             // - ESRCH: no such process
             // - EPERM: process exists but we don't have permission (treat as running)
             use libc::kill;
-            let rc = unsafe { kill(pid as i32, 0) };
+            // A u32 PID that doesn't fit in pid_t (i32) cannot refer to a live
+            // process; reject it instead of silently wrapping via `as`.
+            let Ok(pid) = i32::try_from(pid) else {
+                return false;
+            };
+            let rc = unsafe { kill(pid, 0) };
             if rc == 0 {
                 return true;
             }
@@ -57,7 +62,15 @@ impl ProcessManager {
         #[cfg(unix)]
         {
             use libc::kill;
-            let rc = unsafe { kill(-(pgid as i32), 0) };
+            // Reject unrepresentable PGIDs instead of wrapping via `as`
+            // (a wrapped negative value would probe the wrong process group).
+            let Ok(pgid) = i32::try_from(pgid) else {
+                return false;
+            };
+            let Some(neg_pgid) = pgid.checked_neg() else {
+                return false;
+            };
+            let rc = unsafe { kill(neg_pgid, 0) };
             if rc == 0 {
                 return true;
             }
@@ -74,8 +87,15 @@ impl ProcessManager {
 
     #[cfg(unix)]
     fn process_group_id(pid: u32) -> Option<u32> {
-        let pgid = unsafe { libc::getpgid(pid as i32) };
-        if pgid > 0 { Some(pgid as u32) } else { None }
+        let Ok(pid) = i32::try_from(pid) else {
+            return None;
+        };
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid > 0 {
+            u32::try_from(pgid).ok()
+        } else {
+            None
+        }
     }
 
     #[cfg(unix)]
@@ -339,13 +359,24 @@ impl ProcessManager {
             let send_signal = |signal| {
                 let mut sent = false;
                 for pgid in &watched_pgids {
-                    if unsafe { kill(-(*pgid as i32), signal) } == 0 {
+                    // Skip unrepresentable PGIDs instead of wrapping via `as`.
+                    let Ok(pgid) = i32::try_from(*pgid) else {
+                        continue;
+                    };
+                    let Some(neg_pgid) = pgid.checked_neg() else {
+                        continue;
+                    };
+                    if unsafe { kill(neg_pgid, signal) } == 0 {
                         sent = true;
                     }
                 }
                 for watched_pid in &watched_pids {
+                    // Skip unrepresentable PIDs instead of wrapping via `as`.
+                    let Ok(watched_pid_t) = i32::try_from(*watched_pid) else {
+                        continue;
+                    };
                     if Self::is_pid_running(*watched_pid)
-                        && unsafe { kill(*watched_pid as i32, signal) } == 0
+                        && unsafe { kill(watched_pid_t, signal) } == 0
                     {
                         sent = true;
                     }
