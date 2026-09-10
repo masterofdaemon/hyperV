@@ -322,6 +322,23 @@ impl LogManager {
         Ok(())
     }
 
+    fn log_rotated(reader: &mut BufReader<File>, new_file: &File) -> std::io::Result<bool> {
+        let new = new_file.metadata()?;
+        let old = reader.get_ref().metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (new.dev(), new.ino()) != (old.dev(), old.ino()) {
+                return Ok(true);
+            }
+        }
+        #[cfg(not(unix))]
+        if new.created().ok() != old.created().ok() {
+            return Ok(true);
+        }
+        Ok(new.len() < reader.stream_position()?)
+    }
+
     /// Follow a single log file in real-time
     fn follow_single_log(log_path: &Path) -> Result<()> {
         if !log_path.exists() {
@@ -350,17 +367,12 @@ impl LogManager {
                     thread::sleep(LOG_FOLLOW_INTERVAL);
 
                     // Check if file was rotated or recreated
-                    if let Ok(new_file) = File::open(log_path) {
-                        let new_metadata = new_file.metadata().map_err(HyperVError::Io)?;
-                        let current_metadata =
-                            reader.get_ref().metadata().map_err(HyperVError::Io)?;
-
-                        // If file size decreased or inode changed, file was rotated
-                        if new_metadata.len() < current_metadata.len() {
-                            println!("🔄 Log file rotated, reopening...");
-                            file = new_file;
-                            reader = BufReader::new(file);
-                        }
+                    if let Ok(new_file) = File::open(log_path)
+                        && Self::log_rotated(&mut reader, &new_file).map_err(HyperVError::Io)?
+                    {
+                        println!("🔄 Log file rotated, reopening...");
+                        file = new_file;
+                        reader = BufReader::new(file);
                     }
                     continue;
                 }
@@ -419,9 +431,7 @@ impl LogManager {
                     Ok(_) => {
                         // Check rotation
                         if let Ok(new_file) = File::open(stdout_path)
-                            && let Ok(new_meta) = new_file.metadata()
-                            && let Ok(curr_meta) = reader.get_ref().metadata()
-                            && new_meta.len() < curr_meta.len()
+                            && Self::log_rotated(reader, &new_file).unwrap_or(false)
                         {
                             println!("🔄 Stdout log rotated, reopening...");
                             *reader = BufReader::new(new_file);
@@ -449,9 +459,7 @@ impl LogManager {
                     Ok(_) => {
                         // Check rotation
                         if let Ok(new_file) = File::open(stderr_path)
-                            && let Ok(new_meta) = new_file.metadata()
-                            && let Ok(curr_meta) = reader.get_ref().metadata()
-                            && new_meta.len() < curr_meta.len()
+                            && Self::log_rotated(reader, &new_file).unwrap_or(false)
                         {
                             println!("🔄 Stderr log rotated, reopening...");
                             *reader = BufReader::new(new_file);
@@ -749,6 +757,21 @@ fn is_redaction_key_boundary(input: &str, key_start: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_detects_replacement_and_copytruncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        fs::write(&path, "old").unwrap();
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        reader.seek(SeekFrom::End(0)).unwrap();
+        assert!(!LogManager::log_rotated(&mut reader, &File::open(&path).unwrap()).unwrap());
+        fs::write(&path, "").unwrap();
+        assert!(LogManager::log_rotated(&mut reader, &File::open(&path).unwrap()).unwrap());
+        fs::rename(&path, dir.path().join("old")).unwrap();
+        fs::write(&path, "replacement is larger").unwrap();
+        assert!(LogManager::log_rotated(&mut reader, &File::open(&path).unwrap()).unwrap());
+    }
 
     #[test]
     fn redacts_longer_sensitive_keys_before_prefix_keys() {

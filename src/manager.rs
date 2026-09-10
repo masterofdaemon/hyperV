@@ -33,8 +33,6 @@ pub struct TaskManager {
     config: Config,
     /// Process manager
     process_manager: ProcessManager,
-    /// Held advisory lock on tasks.json while a read-modify-write is in flight.
-    tasks_lock: Option<fs::File>,
 }
 
 impl TaskManager {
@@ -59,29 +57,11 @@ impl TaskManager {
             .map_err(HyperVError::Io)
     }
 
-    /// Run `f` holding an exclusive advisory lock on tasks.json, reloading from disk first so
-    /// the whole read-modify-write is atomic against other hyperV processes (CLI vs daemon).
-    /// Re-entrant: a nested call reuses the held lock, because flock() on a second fd for the
-    /// same file would deadlock against ourselves.
-    pub(crate) fn with_tasks_lock<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        if self.tasks_lock.is_some() {
-            return f(self);
-        }
+    pub(crate) fn lock_tasks_for_update(&mut self) -> Result<fs::File> {
         let lock_file = self.tasks_lock_file()?;
         lock_file.lock_exclusive().map_err(HyperVError::Io)?;
-        self.tasks_lock = Some(lock_file);
-
-        // Clear the flag on unwind too. If a panic left it set, every later operation on this
-        // manager would take the re-entrant path and silently run with no lock held at all.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.load_unlocked().and_then(|()| f(self))
-        }));
-        self.tasks_lock = None;
-
-        match result {
-            Ok(result) => result,
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        self.load_unlocked()?;
+        Ok(lock_file)
     }
 
     /// Create a new task manager
@@ -93,7 +73,6 @@ impl TaskManager {
             tasks: Vec::new(),
             config,
             process_manager,
-            tasks_lock: None,
         };
 
         // Load existing tasks (with locking)
@@ -141,9 +120,6 @@ impl TaskManager {
 
     /// Load tasks from configuration file
     pub(crate) fn load(&mut self) -> Result<()> {
-        if self.tasks_lock.is_some() {
-            return self.load_unlocked();
-        }
         let lock_file = self.tasks_lock_file()?;
         lock_file.lock_shared().map_err(HyperVError::Io)?;
         self.load_unlocked()
@@ -164,17 +140,7 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Save tasks to configuration file
-    pub(crate) fn save(&self) -> Result<()> {
-        if self.tasks_lock.is_some() {
-            return self.save_unlocked();
-        }
-        let lock_file = self.tasks_lock_file()?;
-        lock_file.lock_exclusive().map_err(HyperVError::Io)?;
-        self.save_unlocked()
-    }
-
-    fn save_unlocked(&self) -> Result<()> {
+    pub(crate) fn save_unlocked(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
 
@@ -233,12 +199,11 @@ impl TaskManager {
         workdir: Option<String>,
         auto_restart: bool,
     ) -> Result<()> {
-        self.with_tasks_lock(move |s| {
-            s.create_task_locked(name, binary, args, env_vars, workdir, auto_restart)
-        })
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.create_task_unlocked(name, binary, args, env_vars, workdir, auto_restart)
     }
 
-    fn create_task_locked(
+    pub(crate) fn create_task_unlocked(
         &mut self,
         name: String,
         binary: String,
@@ -247,7 +212,6 @@ impl TaskManager {
         workdir: Option<String>,
         auto_restart: bool,
     ) -> Result<()> {
-
         // Check if task name already exists
         if self.tasks.iter().any(|t| t.name == name) {
             return Err(HyperVError::TaskExists(name));
@@ -335,7 +299,7 @@ impl TaskManager {
             let started = task.last_started.as_deref().unwrap_or("-");
             println!(
                 "{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}",
-                &task.id[..8],
+                task.id.get(..8).unwrap_or(&task.id),
                 task.name,
                 status_display,
                 mem_mb,
@@ -345,28 +309,49 @@ impl TaskManager {
         }
     }
 
-    /// Find a task by identifier (name, ID, or partial ID)
-    pub(crate) fn find_task(&self, identifier: &str) -> Option<&Task> {
-        self.tasks
+    fn find_task_index(&self, identifier: &str) -> Result<Option<usize>> {
+        if let Some(index) = self
+            .tasks
             .iter()
-            .find(|t| t.name == identifier || t.id == identifier || t.id.starts_with(identifier))
+            .position(|t| t.id == identifier || t.name == identifier)
+        {
+            return Ok(Some(index));
+        }
+        let mut matches = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.id.starts_with(identifier));
+        let first = matches.next().map(|(index, _)| index);
+        if matches.next().is_some() {
+            return Err(HyperVError::InvalidInput(format!(
+                "Ambiguous task identifier '{identifier}'"
+            )));
+        }
+        Ok(first)
     }
 
-    /// Find a mutable task by identifier
-    pub(crate) fn find_task_mut(&mut self, identifier: &str) -> Option<&mut Task> {
-        self.tasks
-            .iter_mut()
-            .find(|t| t.name == identifier || t.id == identifier || t.id.starts_with(identifier))
+    pub(crate) fn find_task(&self, identifier: &str) -> Result<Option<&Task>> {
+        Ok(self
+            .find_task_index(identifier)?
+            .map(|index| &self.tasks[index]))
+    }
+
+    pub(crate) fn find_task_mut(&mut self, identifier: &str) -> Result<Option<&mut Task>> {
+        Ok(self
+            .find_task_index(identifier)?
+            .map(|index| &mut self.tasks[index]))
     }
 
     /// Start a task
     pub fn start_task(&mut self, identifier: &str) -> Result<()> {
-        self.with_tasks_lock(|s| s.start_task_locked(identifier))
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.start_task_unlocked(identifier)
     }
 
-    fn start_task_locked(&mut self, identifier: &str) -> Result<()> {
+    pub(crate) fn start_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?
             .clone();
 
@@ -387,11 +372,11 @@ impl TaskManager {
                 return Err(HyperVError::TaskAlreadyRunning(task.name));
             } else {
                 // Process died, update status
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Failed);
                     task_mut.clear_pid();
                 }
-                self.save()?;
+                self.save_unlocked()?;
             }
         }
 
@@ -448,7 +433,7 @@ impl TaskManager {
             Ok(pid) => {
                 let pid_start_time = self.process_manager.process_start_time(pid);
                 // Update task state
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Running);
                     task_mut.set_pid(Some(pid));
                     task_mut.set_pid_start_time(pid_start_time);
@@ -456,7 +441,7 @@ impl TaskManager {
                     task_mut.clear_suppress_restart();
                 }
 
-                self.save()?;
+                self.save_unlocked()?;
                 self.save_running_tasks()?;
                 println!(
                     "✅ Task \"{}\" started successfully with PID {}",
@@ -466,10 +451,10 @@ impl TaskManager {
             }
             Err(e) => {
                 // Update task state to failed
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Failed);
                 }
-                self.save()?;
+                self.save_unlocked()?;
                 Err(e)
             }
         }
@@ -477,13 +462,14 @@ impl TaskManager {
 
     /// Stop a task
     pub fn stop_task(&mut self, identifier: &str) -> Result<()> {
-        self.with_tasks_lock(|s| s.stop_task_locked(identifier))
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.stop_task_unlocked(identifier)
     }
 
-    fn stop_task_locked(&mut self, identifier: &str) -> Result<()> {
+    pub(crate) fn stop_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let (task_name, task_id, pid, binary, pid_start_time) = {
             let task = self
-                .find_task(identifier)
+                .find_task(identifier)?
                 .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
             if task.status != TaskStatus::Running {
@@ -506,10 +492,8 @@ impl TaskManager {
             ))
         })?;
 
-        // The stop intent is published only once the kill has actually succeeded (below).
-        // Publishing it up front would leave a still-Running task permanently suppressed
-        // whenever the kill fails. A daemon tick cannot interleave here anyway: this whole
-        // function runs under the exclusive tasks lock.
+        // Publish stop intent only after termination succeeds. The exclusive tasks lock
+        // prevents daemon ticks from interleaving; a failed stop must not suppress restarts.
         let pid_running = self.process_manager.is_process_running(pid);
         let group_running = self.process_manager.is_process_group_running(pid);
 
@@ -531,7 +515,8 @@ impl TaskManager {
             }
 
             println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
-            self.process_manager.stop_task(&task_id, pid)?;
+            self.process_manager
+                .stop_task(&task_id, pid, &binary, pid_start_time)?;
             // Defensive: only mark stopped if the PID is actually gone.
             if self.process_manager.is_process_running(pid)
                 || self.process_manager.is_process_group_running(pid)
@@ -548,7 +533,8 @@ impl TaskManager {
                 "⚠️  Task \"{}\" PID {} is gone but its process group is still running; stopping group...",
                 task_name, pid
             );
-            self.process_manager.stop_task(&task_id, pid)?;
+            self.process_manager
+                .stop_task(&task_id, pid, &binary, pid_start_time)?;
             if self.process_manager.is_process_group_running(pid) {
                 return Err(HyperVError::ProcessStop(format!(
                     "Process group {} for task \"{}\" did not terminate",
@@ -557,13 +543,13 @@ impl TaskManager {
             }
         }
 
-        if let Some(task) = self.find_task_mut(identifier) {
+        if let Some(task) = self.find_task_mut(identifier)? {
             task.set_status(TaskStatus::Stopped);
             task.suppress_restart = true;
             task.clear_pid();
         }
 
-        self.save()?;
+        self.save_unlocked()?;
         self.save_running_tasks()?;
         println!("✅ Task \"{}\" stopped", task_name);
         Ok(())
@@ -571,47 +557,41 @@ impl TaskManager {
 
     /// Restart a task (stop if running, then start).
     pub fn restart_task(&mut self, identifier: &str) -> Result<()> {
-        self.with_tasks_lock(|s| s.restart_task_locked(identifier))
-    }
-
-    fn restart_task_locked(&mut self, identifier: &str) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
         let (task_name, is_running) = {
             let task = self
-                .find_task(identifier)
+                .find_task(identifier)?
                 .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
             (task.name.clone(), task.status == TaskStatus::Running)
         };
 
         if is_running {
-            self.stop_task(identifier)?;
+            self.stop_task_unlocked(identifier)?;
         }
 
-        self.start_task(&task_name)
+        self.start_task_unlocked(&task_name)
     }
 
     /// Remove a task
     pub fn remove_task(&mut self, identifier: &str) -> Result<()> {
-        self.with_tasks_lock(|s| s.remove_task_locked(identifier))
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.remove_task_unlocked(identifier)
     }
 
-    fn remove_task_locked(&mut self, identifier: &str) -> Result<()> {
+    pub(crate) fn remove_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let task_index = self
-            .tasks
-            .iter()
-            .position(|t| {
-                t.name == identifier || t.id == identifier || t.id.starts_with(identifier)
-            })
+            .find_task_index(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         // Check if task is running and stop it first
         let is_running = self.tasks[task_index].status == TaskStatus::Running;
         if is_running {
-            self.stop_task(identifier)?;
+            self.stop_task_unlocked(identifier)?;
         }
 
         let task_name = self.tasks[task_index].name.clone();
         self.tasks.remove(task_index);
-        self.save()?;
+        self.save_unlocked()?;
         self.save_running_tasks()?;
 
         println!("✅ Task \"{}\" removed", task_name);
@@ -624,7 +604,7 @@ impl TaskManager {
 
         match identifier {
             Some(id) => {
-                if let Some(task) = self.find_task(id) {
+                if let Some(task) = self.find_task(id)? {
                     task.print_details();
                 } else {
                     println!("❌ Task \"{}\" not found", id);
@@ -654,7 +634,7 @@ impl TaskManager {
         summary: bool,
     ) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         let stdout_path = self.config.stdout_log_path(&task.id);
@@ -666,7 +646,7 @@ impl TaskManager {
     /// Diagnose a task's binary
     pub fn diagnose_task(&self, identifier: &str) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         println!("🔍 Diagnosing task: {}", task.name);
@@ -689,90 +669,55 @@ impl TaskManager {
     pub fn check_and_restart_tasks(&mut self) -> Result<()> {
         use crate::constants::{MAX_RESTART_ATTEMPTS, RESTART_DELAY};
 
-        // Claim the candidates under one short lock: bumping the restart counters before
-        // releasing it is what stops a second process from claiming the same tasks. The slow
-        // part (backoff plus spawn) then runs unlocked, so a restart pass no longer blocks
-        // every other hyperV process for RESTART_DELAY per failed task.
-        let to_restart = self.with_tasks_lock(|s| {
-            let claimed: Vec<(String, u32)> = s
-                .tasks
-                .iter_mut()
-                .filter(|task| {
-                    task.auto_restart
-                        && !task.suppress_restart
-                        && task.status == TaskStatus::Failed
-                        && task.restart_count < MAX_RESTART_ATTEMPTS
-                })
-                .map(|task| {
-                    task.increment_restart_count();
-                    (task.name.clone(), task.restart_count)
-                })
-                .collect();
+        let _lock_file = self.lock_tasks_for_update()?;
 
-            if !claimed.is_empty() {
-                s.save_unlocked()?;
-            }
-            Ok(claimed)
-        })?;
+        let tasks_to_restart: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.auto_restart
+                    && !task.suppress_restart
+                    && task.status == TaskStatus::Failed
+                    && task.restart_count < MAX_RESTART_ATTEMPTS
+            })
+            .map(|task| task.id.clone())
+            .collect();
 
-        for (task_name, attempt) in to_restart {
-            println!(
-                "🔄 Auto-restarting failed task: {} (attempt {}/{})",
-                task_name, attempt, MAX_RESTART_ATTEMPTS
-            );
+        for task_id in tasks_to_restart {
+            if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                println!(
+                    "🔄 Auto-restarting failed task: {} (attempt {}/{})",
+                    task.name,
+                    task.restart_count + 1,
+                    MAX_RESTART_ATTEMPTS
+                );
 
-            // Small delay before restart
-            std::thread::sleep(RESTART_DELAY);
+                task.increment_restart_count();
+                let task_name = task.name.clone();
+                self.save_unlocked()?;
 
-            // start_task takes the lock itself, and already marks the task Failed if the
-            // spawn fails; on its other error paths the task is still Failed from above.
-            if let Err(e) = self.start_task(&task_name) {
-                println!("❌ Failed to auto-restart task \"{}\": {}", task_name, e);
-            } else {
-                println!("✅ Task \"{}\" restarted successfully", task_name);
+                // Small delay before restart
+                std::thread::sleep(RESTART_DELAY);
+
+                if let Err(e) = self.start_task_unlocked(&task_name) {
+                    println!("❌ Failed to auto-restart task \"{}\": {}", task_name, e);
+                    // Mark as failed again if restart fails
+                    if let Some(task_mut) = self.find_task_mut(&task_name)? {
+                        task_mut.set_status(TaskStatus::Failed);
+                    }
+                    self.save_unlocked()?;
+                } else {
+                    println!("✅ Task \"{}\" restarted successfully", task_name);
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Refresh task statuses by checking if running processes are still alive.
-    ///
-    /// This serves the display commands, where the scan almost always finds nothing to
-    /// correct, so it runs under a shared lock and only escalates to the exclusive one when
-    /// there is something to write back. That keeps `list`/`status` off the write lock.
+    /// Refresh task statuses by checking if running processes are still alive
     pub fn refresh_task_statuses(&mut self) -> Result<()> {
-        if self.tasks_lock.is_some() {
-            return self.refresh_task_statuses_locked();
-        }
-
-        {
-            let lock_file = self.tasks_lock_file()?;
-            lock_file.lock_shared().map_err(HyperVError::Io)?;
-            self.load_unlocked()?;
-            if !self.scan_task_statuses() {
-                return Ok(());
-            }
-        }
-
-        // Something needs persisting. Redo the whole read-modify-write under the exclusive
-        // lock rather than writing back what we saw through the shared one, which may have
-        // gone stale in between.
-        self.with_tasks_lock(|s| s.refresh_task_statuses_locked())
-    }
-
-    fn refresh_task_statuses_locked(&mut self) -> Result<()> {
-        if self.scan_task_statuses() {
-            self.save()?;
-            self.save_running_tasks()?;
-        }
-
-        Ok(())
-    }
-
-    /// Reconcile in-memory task statuses with actual process liveness.
-    /// Returns whether anything changed and therefore needs persisting.
-    fn scan_task_statuses(&mut self) -> bool {
+        let _lock_file = self.lock_tasks_for_update()?;
         let mut updated = false;
 
         for task in &mut self.tasks {
@@ -800,7 +745,12 @@ impl TaskManager {
             }
         }
 
-        updated
+        if updated {
+            self.save_unlocked()?;
+            self.save_running_tasks()?;
+        }
+
+        Ok(())
     }
 
     /// Get the number of tasks
@@ -833,10 +783,8 @@ impl TaskManager {
 
     /// Clean up zombie processes, update task states, and return tasks that failed in this pass.
     pub fn cleanup_with_events(&mut self) -> Result<Vec<Task>> {
-        self.with_tasks_lock(|s| s.cleanup_with_events_locked())
-    }
+        let _lock_file = self.lock_tasks_for_update()?;
 
-    fn cleanup_with_events_locked(&mut self) -> Result<Vec<Task>> {
         let exit_codes = self.process_manager.cleanup_zombies();
 
         // Update task states for processes that are no longer running
@@ -873,7 +821,7 @@ impl TaskManager {
         }
 
         if changed {
-            self.save()?;
+            self.save_unlocked()?;
             self.save_running_tasks()?;
         }
 
@@ -897,25 +845,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panicking_operation_does_not_leave_the_lock_flag_set() {
+    fn panicking_operation_releases_tasks_lock() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Safe here: this is the only unit test in this module that touches the environment.
-        unsafe { std::env::set_var("HYPERV_CONFIG_DIR", dir.path()) };
-        let mut manager = TaskManager::new().unwrap();
-
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        let mut manager = TaskManager {
+            tasks: Vec::new(),
+            config: Config {
+                config_dir: dir.path().into(),
+                tasks_file: dir.path().join("tasks.json"),
+                running_tasks_file: dir.path().join("running_tasks.json"),
+                logs_dir: dir.path().join("logs"),
+            },
+            process_manager: ProcessManager::new(),
+        };
+        let probe = manager.tasks_lock_file().unwrap();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            manager.with_tasks_lock(|_| -> Result<()> { panic!("boom") })
+            let _lock_file = manager.lock_tasks_for_update().unwrap();
+            assert!(probe.try_lock_exclusive().is_err());
+            panic!("boom");
         }));
-        std::panic::set_hook(previous_hook);
+        let panic = outcome.expect_err("the panic should still propagate");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"boom"));
+        probe
+            .try_lock_exclusive()
+            .expect("panic must release the lock");
+        FileExt::unlock(&probe).unwrap();
 
-        assert!(outcome.is_err(), "the panic should still propagate");
-        assert!(
-            manager.tasks_lock.is_none(),
-            "a panic left the lock flag set, so later operations would run unlocked"
-        );
-        // Still usable, and still actually taking the lock.
-        manager.with_tasks_lock(|s| Ok(s.tasks.len())).unwrap();
+        // Subsequent operations must still acquire the actual file lock.
+        let _lock_file = manager.lock_tasks_for_update().unwrap();
+        assert!(probe.try_lock_exclusive().is_err());
     }
 }

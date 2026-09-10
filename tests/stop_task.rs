@@ -55,7 +55,7 @@ mod unix {
 
         let mut pm = ProcessManager::new();
 
-        // Use an absolute path because hyperV validates binaries by path existence.
+        // Use a known system binary.
         let sleep_bin = if std::path::Path::new("/bin/sleep").exists() {
             "/bin/sleep"
         } else {
@@ -85,11 +85,20 @@ mod unix {
             "process should be running"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task");
+        assert!(
+            pm.stop_task(&task.id, pid, &task.binary, Some(u64::MAX))
+                .is_err()
+        );
+        assert!(pm.is_process_running(pid));
+        assert!(pm.is_task_running(&task.id));
+
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task");
         assert!(!pm.is_process_running(pid), "process should be stopped");
 
         // Stopping again should be a no-op success.
-        pm.stop_task(&task.id, pid).expect("stop_task again");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task again");
     }
 
     #[test]
@@ -132,7 +141,8 @@ exit 0
             "process group should be running"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task");
 
         assert!(
             !pm.is_process_group_running(pid),
@@ -147,7 +157,7 @@ exit 0
         let stderr = dir.path().join("stderr.log");
 
         let mut pm = ProcessManager::new();
-        // Use an absolute path because hyperV validates binaries by path existence.
+        // Use a known system binary.
         let bash_bin = if std::path::Path::new("/bin/bash").exists() {
             "/bin/bash"
         } else {
@@ -160,7 +170,7 @@ exit 0
             vec![
                 "-c".to_string(),
                 // Ignore SIGTERM so stop_task has to use SIGKILL.
-                "trap '' TERM; while true; do sleep 1; done".to_string(),
+                "trap '' TERM; echo ready; while true; do sleep 1; done".to_string(),
             ],
             HashMap::new(),
             Some(dir.path().to_string_lossy().to_string()),
@@ -179,6 +189,13 @@ exit 0
             "process should be running"
         );
 
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                std::fs::read_to_string(&stdout).is_ok_and(|output| output.contains("ready"))
+            }),
+            "SIGTERM handler should be installed"
+        );
+
         // Prove it ignores SIGTERM (otherwise we'd accidentally only test the SIGTERM path).
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         std::thread::sleep(Duration::from_millis(150));
@@ -187,7 +204,8 @@ exit 0
             "process/group should still be running after SIGTERM"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task");
         assert!(
             !pm.is_process_running(pid) && !pm.is_process_group_running(pid),
             "process/group should be stopped"
@@ -263,7 +281,8 @@ child.wait()
             "child should be running"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task");
 
         assert!(
             wait_until(Duration::from_secs(2), || !pm.is_process_running(child_pid)),
@@ -316,7 +335,8 @@ child.wait()
             "identity check should fail for mismatched binary without start_time"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task cleanup");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task cleanup");
     }
 
     #[test]
@@ -364,6 +384,7 @@ while true; do sleep 1; done
             "identity check should work with start_time"
         );
 
-        pm.stop_task(&task.id, pid).expect("stop_task cleanup");
+        pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
+            .expect("stop_task cleanup");
     }
 }
