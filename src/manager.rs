@@ -8,11 +8,13 @@ use crate::error::{HyperVError, Result};
 use crate::logs::{LogManager, LogType};
 use crate::process::{ProcessManager, diagnose_binary};
 use crate::task::{Task, TaskStatus};
+use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use sysinfo::{Pid, System};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -283,14 +285,11 @@ impl TaskManager {
             return;
         }
 
-        println!(
-            "{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}",
-            "ID", "NAME", "STATUS", "MEM(MB)", "STARTED", "BINARY"
-        );
-        println!("{}", "-".repeat(140));
-
         let mut sys = System::new();
         sys.refresh_processes();
+        let now = Utc::now();
+        let header = ["ID", "NAME", "STATUS", "MEM(MB)", "STARTED", "BINARY"].map(str::to_owned);
+        let mut rows = Vec::with_capacity(self.tasks.len());
 
         for task in &self.tasks {
             let status_display = task.status.display_with_icon();
@@ -301,16 +300,46 @@ impl TaskManager {
                 0
             };
 
-            let started = task.last_started.as_deref().unwrap_or("-");
-            println!(
-                "{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}",
-                task.id.get(..8).unwrap_or(&task.id),
-                task.name,
-                status_display,
-                mem_mb,
-                started,
-                task.binary
-            );
+            rows.push([
+                task.id.chars().take(8).collect::<String>(),
+                middle_ellipsis(&task.name, 32),
+                status_display.to_owned(),
+                mem_mb.to_string(),
+                format_started(task.last_started.as_deref(), now),
+                task.binary.clone(),
+            ]);
+        }
+
+        let mut widths = std::array::from_fn::<_, 6, _>(|column| {
+            rows.iter()
+                .chain(std::iter::once(&header))
+                .map(|row| row[column].width())
+                .max()
+                .unwrap_or(0)
+        });
+        // ponytail: fixed 120-column budget; detect terminal width if configurability is needed.
+        let binary_width = 120 - widths[..5].iter().sum::<usize>() - 10;
+        for row in &mut rows {
+            row[5] = middle_ellipsis(&row[5], binary_width);
+        }
+        widths[5] = rows
+            .iter()
+            .map(|row| row[5].width())
+            .max()
+            .unwrap_or(0)
+            .max(header[5].width());
+
+        for (index, row) in std::iter::once(&header).chain(&rows).enumerate() {
+            for (column, value) in row.iter().enumerate() {
+                print!("{value}");
+                if column < 5 {
+                    print!("{}", " ".repeat(widths[column] - value.width() + 2));
+                }
+            }
+            println!();
+            if index == 0 {
+                println!("{}", "-".repeat(widths.iter().sum::<usize>() + 10));
+            }
         }
     }
 
@@ -839,9 +868,83 @@ impl TaskManager {
     }
 }
 
+fn format_started(started: Option<&str>, now: DateTime<Utc>) -> String {
+    let Some(started) = started.and_then(|value| DateTime::parse_from_rfc3339(value).ok()) else {
+        return "-".to_owned();
+    };
+    let seconds = now.signed_duration_since(started).num_seconds();
+    let (count, unit) = match seconds {
+        ..60 => return "just now".to_owned(),
+        60..3600 => (seconds / 60, "minute"),
+        3600..86400 => (seconds / 3600, "hour"),
+        86400..2592000 => (seconds / 86400, "day"),
+        _ => return started.format("%Y-%m-%d").to_string(),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
+fn middle_ellipsis(value: &str, max_width: usize) -> String {
+    // Keep task names and paths on one line, even if they contain control characters.
+    let value = value.replace(char::is_control, " ");
+    if value.width() <= max_width {
+        return value;
+    }
+    // Favor the suffix so executable names remain recognizable. Count zero-width
+    // scalars conservatively here, since variation selectors can widen an emoji.
+    let prefix_budget = (max_width - 3) / 3;
+    let mut width = 0;
+    let mut prefix_end = 0;
+    for (index, ch) in value.char_indices() {
+        width += ch.width().unwrap_or(0).max(1);
+        if width > prefix_budget {
+            break;
+        }
+        prefix_end = index + ch.len_utf8();
+    }
+    let mut width = 0;
+    let mut suffix_start = value.len();
+    for (index, ch) in value.char_indices().rev() {
+        width += ch.width().unwrap_or(0).max(1);
+        if width > max_width - 3 - prefix_budget {
+            break;
+        }
+        suffix_start = index;
+    }
+    format!("{}...{}", &value[..prefix_end], &value[suffix_start..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn started_display_handles_boundaries_and_invalid_dates() {
+        let now = "2026-09-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for (seconds, expected) in [
+            (-60, "just now"),
+            (0, "just now"),
+            (59, "just now"),
+            (60, "1 minute ago"),
+            (300, "5 minutes ago"),
+            (3599, "59 minutes ago"),
+            (3600, "1 hour ago"),
+            (10800, "3 hours ago"),
+            (86399, "23 hours ago"),
+            (86400, "1 day ago"),
+            (172800, "2 days ago"),
+            (2591999, "29 days ago"),
+            (2592000, "2026-08-11"),
+        ] {
+            let started = (now - chrono::Duration::seconds(seconds)).to_rfc3339();
+            assert_eq!(format_started(Some(&started), now), expected);
+        }
+        assert_eq!(format_started(None, now), "-");
+        assert_eq!(format_started(Some("invalid"), now), "-");
+        assert_eq!(
+            format_started(Some("2026-09-10T14:55:00.000000+03:00"), now),
+            "5 minutes ago"
+        );
+    }
 
     #[test]
     fn panicking_operation_releases_tasks_lock() {

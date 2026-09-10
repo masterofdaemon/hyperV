@@ -67,6 +67,105 @@ fn test_help() {
 }
 
 #[test]
+fn list_table_aligns_unicode_and_caps_long_values_without_changing_storage() {
+    use hyperV::{Task, TaskStatus};
+    use unicode_width::UnicodeWidthStr;
+
+    let temp = TempDir::new().unwrap();
+    let long_path = format!(
+        "/Users/{}/run-hourly-monitor.zsh",
+        "very-long-directory/".repeat(8)
+    );
+    let cases = [
+        (
+            "logger".to_owned(),
+            "/bin/bash".to_owned(),
+            TaskStatus::Stopped,
+        ),
+        (
+            "desktop-screenshot-watcher".to_owned(),
+            long_path.clone(),
+            TaskStatus::Running,
+        ),
+        (
+            "selling-spider-hourly".to_owned(),
+            long_path.clone(),
+            TaskStatus::Failed,
+        ),
+        (
+            "監視🟢e\u{301}".repeat(20),
+            format!("/資料/{}/終端.sh", "目錄/".repeat(40)),
+            TaskStatus::Stopped,
+        ),
+        (
+            "line\nbreak".to_owned(),
+            "/bin/tab\tpath".to_owned(),
+            TaskStatus::Stopped,
+        ),
+        (
+            "❤️".repeat(80),
+            format!("/{}", "❤️".repeat(80)),
+            TaskStatus::Stopped,
+        ),
+    ];
+    let tasks: Vec<_> = cases
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, binary, status))| {
+            let mut task = Task::new(
+                format!("{i:08}-0000-0000-0000-000000000000"),
+                name,
+                binary,
+                Vec::new(),
+                Default::default(),
+                None,
+                false,
+                None,
+                None,
+            );
+            task.status = status;
+            task.last_started = Some("2025-08-07T19:43:06.045078+00:00".to_owned());
+            task
+        })
+        .collect();
+    let tasks_path = temp.path().join("tasks.json");
+    let stored = serde_json::to_string_pretty(&tasks).unwrap();
+    std::fs::write(&tasks_path, &stored).unwrap();
+
+    let output = hyperv_cmd(&temp)
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let lines: Vec<_> = output.lines().collect();
+    assert_eq!(lines.len(), tasks.len() + 2);
+    assert!(lines.iter().all(|line| line.width() <= 120), "{output}");
+    let headers: Vec<_> = ["ID", "NAME", "STATUS", "MEM(MB)", "STARTED", "BINARY"]
+        .map(|label| lines[0].find(label).unwrap())
+        .into();
+    assert_eq!(headers[1], 10, "ID should use only eight columns");
+    for (line, task) in lines[2..].iter().zip(&tasks) {
+        let status = line.find(task.status.display_with_icon()).unwrap();
+        assert_eq!(line[..status].width(), headers[2], "{line}");
+        let memory = status + task.status.display_with_icon().len();
+        let memory = memory + line[memory..].find('0').unwrap();
+        assert_eq!(line[..memory].width(), headers[3], "{line}");
+        let started = line.find("2025-08-07").unwrap();
+        assert_eq!(line[..started].width(), headers[4], "{line}");
+        let binary = line.find('/').unwrap();
+        assert_eq!(line[..binary].width(), headers[5], "{line}");
+    }
+    assert!(lines[3].contains("desktop-screenshot-watcher"));
+    assert!(lines[3].ends_with("run-hourly-monitor.zsh"));
+    assert!(lines[3].contains("..."));
+    assert!(lines[5].ends_with("終端.sh"));
+    assert_eq!(std::fs::read_to_string(tasks_path).unwrap(), stored);
+}
+
+#[test]
 fn test_lifecycle() {
     let temp = TempDir::new().unwrap();
     let logger = abs_repo_path("tests/logger.sh");
