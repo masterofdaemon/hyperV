@@ -78,12 +78,23 @@ async fn main() -> Result<()> {
         Commands::Up { file, start } => {
             let compose = ComposeFile::from_path(&file)?;
             task_manager.up_from_compose(&compose)?;
+            let mut start_failures = Vec::new();
             if start {
                 for name in compose.services.keys() {
-                    let _ = task_manager.start_task(name);
+                    if let Err(e) = task_manager.start_task(name) {
+                        eprintln!("❌ Failed to start service \"{name}\": {e}");
+                        start_failures.push(format!("{name}: {e}"));
+                    }
                 }
             }
             maybe_spawn_daemon(&mut task_manager)?;
+            if !start_failures.is_empty() {
+                return Err(hyperV::HyperVError::ProcessError(format!(
+                    "Failed to start {} service(s): {}",
+                    start_failures.len(),
+                    start_failures.join("; ")
+                )));
+            }
             println!("✅ Applied services from {}", file);
         }
         Commands::Down { file } => {

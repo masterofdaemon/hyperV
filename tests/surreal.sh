@@ -13,14 +13,21 @@ set -euo pipefail
 : "${SURREAL_USER:=root}"
 : "${SURREAL_PASSWORD:=root}"
 
-# Compose command
-SURREAL_CMD="surreal start --bind ${SURREAL_HOST}:${SURREAL_PORT} rocksdb:${SURREAL_STORAGE_PATH} --log ${SURREAL_LOG_LEVEL} --user ${SURREAL_USER} --password ${SURREAL_PASSWORD}"
+# Pass the password via the environment instead of a `--password` CLI arg:
+# CLI args are visible in `ps` output, while env vars are not. SurrealDB reads
+# the initial root password from SURREAL_PASS.
+export SURREAL_PASS="${SURREAL_PASSWORD}"
 
-echo "Starting SurrealDB with command:"
-echo "  ${SURREAL_CMD}"
+# Log startup without the secret (never echo the password).
+echo "Starting SurrealDB on ${SURREAL_HOST}:${SURREAL_PORT} (user: ${SURREAL_USER}, storage: ${SURREAL_STORAGE_PATH})"
 
 # Ensure storage directory exists
 mkdir -p "${SURREAL_STORAGE_PATH}"
 
-# Exec the command so this script does not remain as the parent process
-exec bash -lc "${SURREAL_CMD}"
+# Exec directly (no intermediate `bash -lc "<cmd string>"`) so the secret
+# never appears in another process's command line either.
+exec surreal start \
+  --bind "${SURREAL_HOST}:${SURREAL_PORT}" \
+  "rocksdb:${SURREAL_STORAGE_PATH}" \
+  --log "${SURREAL_LOG_LEVEL}" \
+  --user "${SURREAL_USER}"

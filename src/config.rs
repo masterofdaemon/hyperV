@@ -74,9 +74,3 @@ impl Config {
         self.config_dir.join("daemon.pid")
     }
 }
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize configuration")
-    }
-}

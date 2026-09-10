@@ -25,5 +25,8 @@ services:
       SURREAL_STORAGE_PATH: "/tmp/surreal_data"
       SURREAL_LOG_LEVEL: "info"
       SURREAL_USER: "root"
-      SURREAL_PASSWORD: "secret"
+      # Set the real password via the SURREAL_PASSWORD environment variable
+      # (or a .env file in workdir); it is expanded at load time so the
+      # secret is never committed to the repo.
+      SURREAL_PASSWORD: "${SURREAL_PASSWORD:-changeme-set-SURREAL_PASSWORD-in-environment}"
     auto_restart: true

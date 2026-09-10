@@ -151,7 +151,13 @@ impl TaskManager {
         // Backup previous file if exists
         if self.config.tasks_file.exists() {
             let backup_path = self.config.tasks_file.with_extension("json.prev");
-            let _ = fs::copy(&self.config.tasks_file, &backup_path);
+            if let Err(e) = fs::copy(&self.config.tasks_file, &backup_path) {
+                eprintln!(
+                    "⚠️  Failed to back up tasks file to {}: {}",
+                    backup_path.display(),
+                    e
+                );
+            }
         }
 
         fs::rename(&tmp_path, &self.config.tasks_file).map_err(HyperVError::Io)?;
@@ -831,12 +837,6 @@ impl TaskManager {
     /// Whether any task has auto-restart enabled
     pub fn any_autorestart_enabled(&self) -> bool {
         self.tasks.iter().any(|t| t.auto_restart)
-    }
-}
-
-impl Default for TaskManager {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize task manager")
     }
 }
 
