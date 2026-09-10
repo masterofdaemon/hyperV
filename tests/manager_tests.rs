@@ -1,4 +1,4 @@
-use hyperv::{Task, TaskManager, TaskStatus};
+use hyperV::{Task, TaskManager, TaskStatus};
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 
@@ -163,7 +163,7 @@ fn mutations_reload_state_and_reject_ambiguous_prefixes() {
 
 #[test]
 fn compose_stops_before_update_and_reports_partial_teardown() {
-    use hyperv::compose::{ComposeFile, Service};
+    use hyperV::compose::{ComposeFile, Service};
     with_temp_config(|temp| {
         let mut manager = TaskManager::new().unwrap();
         let service = Service {
@@ -181,7 +181,7 @@ fn compose_stops_before_update_and_reports_partial_teardown() {
         let pid = read_tasks(temp)[0].pid.unwrap();
         compose.services.get_mut("worker").unwrap().binary = "/bin/echo".into();
         manager.up_from_compose(&compose).unwrap();
-        assert!(!hyperv::process::ProcessManager::new().is_process_running(pid));
+        assert!(!hyperV::process::ProcessManager::new().is_process_running(pid));
         let mut tasks = read_tasks(temp);
         assert_eq!(tasks[0].status, TaskStatus::Stopped);
         assert_eq!(tasks[0].binary, "/bin/echo");
@@ -254,7 +254,7 @@ fn concurrent_starts_spawn_only_once() {
         );
         assert!(results.iter().any(|(_, result)| matches!(
             result,
-            Err(hyperv::error::HyperVError::TaskAlreadyRunning(_))
+            Err(hyperV::error::HyperVError::TaskAlreadyRunning(_))
         )));
     });
 }

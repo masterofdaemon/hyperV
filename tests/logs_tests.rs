@@ -1,5 +1,5 @@
-use hyperv::constants::{MAX_LOG_ARCHIVES, MAX_LOG_SIZE};
-use hyperv::logs::{LogManager, LogType};
+use hyperV::constants::{MAX_LOG_ARCHIVES, MAX_LOG_SIZE};
+use hyperV::logs::{LogManager, LogType};
 use std::fs;
 use tempfile::TempDir;
 

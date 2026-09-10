@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
-use hyperv::alerts::{AlertReason, AlertTracker};
-use hyperv::constants::MAX_RESTART_ATTEMPTS;
-use hyperv::{Task, TaskStatus};
+use hyperV::alerts::{AlertReason, AlertTracker};
+use hyperV::constants::MAX_RESTART_ATTEMPTS;
+use hyperV::{Task, TaskStatus};
 use std::collections::HashMap;
 
 fn task_with_state(id: &str, name: &str, restart_count: u32, exit_code: Option<i32>) -> Task {

@@ -5,11 +5,11 @@
 
 use chrono::Utc;
 use clap::Parser;
-use hyperv::alerts::{Alert, AlertTracker, TelegramNotifier, format_alert_message};
-use hyperv::compose::ComposeFile;
-use hyperv::config::Config;
-use hyperv::constants::MAX_RESTART_ATTEMPTS;
-use hyperv::{
+use hyperV::alerts::{Alert, AlertTracker, TelegramNotifier, format_alert_message};
+use hyperV::compose::ComposeFile;
+use hyperV::config::Config;
+use hyperV::constants::MAX_RESTART_ATTEMPTS;
+use hyperV::{
     Result,
     cli::{Cli, Commands},
     manager::TaskManager,
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon_mode(mut task_manager: TaskManager) -> Result<()> {
-    use hyperv::constants::MAIN_LOOP_INTERVAL;
+    use hyperV::constants::MAIN_LOOP_INTERVAL;
     use tokio::signal;
     use tokio::time::sleep;
 
@@ -188,11 +188,11 @@ fn write_daemon_pid() -> Result<std::fs::File> {
         .create(true)
         .truncate(true)
         .open(&pid_path)
-        .map_err(hyperv::HyperVError::Io)?;
+        .map_err(hyperV::HyperVError::Io)?;
 
     // Try to lock the file explicitly
     file.try_lock_exclusive().map_err(|e| {
-        hyperv::HyperVError::TaskAlreadyRunning(format!(
+        hyperV::HyperVError::TaskAlreadyRunning(format!(
             "Daemon is already running or could not lock PID file: {}",
             e
         ))
@@ -201,7 +201,7 @@ fn write_daemon_pid() -> Result<std::fs::File> {
     let pid = std::process::id();
     use std::io::Write;
     let mut file_write = &file;
-    write!(file_write, "{}", pid).map_err(hyperv::HyperVError::Io)?;
+    write!(file_write, "{}", pid).map_err(hyperV::HyperVError::Io)?;
 
     // Return the file to keep the lock alive
     Ok(file)
@@ -254,7 +254,7 @@ fn maybe_spawn_daemon(task_manager: &mut TaskManager) -> Result<()> {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|e| hyperv::HyperVError::ProcessStart("daemon".into(), e.to_string()))?;
+                .map_err(|e| hyperV::HyperVError::ProcessStart("daemon".into(), e.to_string()))?;
         }
     }
     Ok(())
