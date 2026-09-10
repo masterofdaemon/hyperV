@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn hyperv_cmd(temp_dir: &TempDir) -> Command {
@@ -252,49 +253,47 @@ fn test_daemon_locking() {
     let temp = TempDir::new().unwrap();
     let bin_path = assert_cmd::cargo::cargo_bin("hyperV");
 
+    // Kills the daemon on every exit path, including an assertion panic.
+    struct Reaper(std::process::Child);
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     // Start daemon in background using std::process::Command
-    let mut child = std::process::Command::new(&bin_path)
-        .arg("daemon")
-        .env("HYPERV_CONFIG_DIR", temp.path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let _daemon = Reaper(
+        std::process::Command::new(&bin_path)
+            .arg("daemon")
+            .env("HYPERV_CONFIG_DIR", temp.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
-    // Give it a moment to start and lock
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wait for the daemon to actually hold the PID lock. It writes its pid only after
+    // locking, so a non-empty file means the lock is held. A fixed sleep loses this race
+    // under load, and losing it means the second daemon starts for real and runs forever.
+    let pid_path = temp.path().join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::read(&pid_path).is_ok_and(|pid| !pid.is_empty()) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never acquired the PID lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
-    // Try to start another daemon using assert_cmd
+    // Try to start another daemon using assert_cmd. The timeout is a backstop: if this one
+    // ever does acquire the lock it daemonizes, and without it the test would hang forever
+    // instead of failing.
     hyperv_cmd(&temp)
         .arg("daemon")
+        .timeout(Duration::from_secs(30))
         .assert()
         .failure() // Should fail
         .stderr(predicate::str::contains("Daemon is already running"));
-
-    // Clean up
-    #[cfg(unix)]
-    {
-        use std::time::{Duration, Instant};
-        let pid = child.id() as i32;
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGKILL);
-        }
-
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            if let Ok(Some(_)) = child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("daemon did not terminate after SIGKILL");
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-        let _ = child.try_wait();
-    }
 }

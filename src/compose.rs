@@ -36,6 +36,10 @@ impl ComposeFile {
 impl TaskManager {
     /// Apply services from a compose file: create or update tasks to match the file
     pub fn up_from_compose(&mut self, compose: &ComposeFile) -> Result<()> {
+        self.with_tasks_lock(|s| s.up_from_compose_locked(compose))
+    }
+
+    fn up_from_compose_locked(&mut self, compose: &ComposeFile) -> Result<()> {
         // Create or update tasks for each service
         for (name, svc) in &compose.services {
             // Convert env map to vec of KEY=VALUE like CLI create expects
@@ -72,14 +76,35 @@ impl TaskManager {
 
     /// Remove tasks that are defined in the compose file
     pub fn down_from_compose(&mut self, compose: &ComposeFile) -> Result<()> {
-        let names: Vec<String> = compose.services.keys().cloned().collect();
-        for name in names {
-            if self.find_task(&name).is_some() {
-                // Stop if running, then remove
-                let _ = self.stop_task(&name);
-                let _ = self.remove_task(&name);
+        self.with_tasks_lock(|s| s.down_from_compose_locked(compose))
+    }
+
+    fn down_from_compose_locked(&mut self, compose: &ComposeFile) -> Result<()> {
+        // Tear every service down before reporting, so one stubborn task does not strand the
+        // rest, but do report: silently swallowing these left `down` claiming success while
+        // tasks were still configured and running.
+        let mut failed: Vec<&str> = Vec::new();
+
+        for name in compose.services.keys() {
+            if self.find_task(name).is_none() {
+                continue;
+            }
+            // remove_task stops the task first if it is still running.
+            if let Err(e) = self.remove_task(name) {
+                eprintln!("⚠️  Failed to remove task \"{}\": {}", name, e);
+                failed.push(name);
             }
         }
-        Ok(())
+
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(HyperVError::ProcessStop(format!(
+                "could not remove {} of {} service(s): {}",
+                failed.len(),
+                compose.services.len(),
+                failed.join(", ")
+            )))
+        }
     }
 }
