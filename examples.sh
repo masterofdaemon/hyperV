@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Example usage of hyperV service manager
 
@@ -23,7 +24,8 @@ $HYPERV new --name "test-service" \
     --auto-restart
 
 echo -e "\n2. Creating a log service that writes to a file..."
-cat > /tmp/log_service.sh << 'EOF'
+LOG_SERVICE=$(mktemp /tmp/log_service.XXXXXX)
+cat > "$LOG_SERVICE" << 'EOF'
 #!/bin/bash
 echo "Log service starting at $(date)"
 for i in {1..20}; do
@@ -32,14 +34,15 @@ for i in {1..20}; do
 done
 echo "Log service completed at $(date)"
 EOF
-chmod +x /tmp/log_service.sh
+chmod +x "$LOG_SERVICE"
 
 $HYPERV new --name "log-service" \
-    --binary "/tmp/log_service.sh" \
+    --binary "$LOG_SERVICE" \
     --env "LOG_LEVEL=INFO"
 
 echo -e "\n3. Creating a simple Python HTTP server..."
-cat > /tmp/simple_server.py << 'EOF'
+SIMPLE_SERVER=$(mktemp /tmp/simple_server.XXXXXX)
+cat > "$SIMPLE_SERVER" << 'EOF'
 #!/usr/bin/env python3
 import http.server
 import socketserver
@@ -67,11 +70,11 @@ with socketserver.TCPServer(("", PORT), MyHTTPRequestHandler) as httpd:
     print(f"Server running on port {PORT}")
     httpd.serve_forever()
 EOF
-chmod +x /tmp/simple_server.py
+chmod +x "$SIMPLE_SERVER"
 
 $HYPERV new --name "web-server" \
     --binary "/usr/bin/python3" \
-    --args "/tmp/simple_server.py" \
+    --args "$SIMPLE_SERVER" \
     --env "PORT=8080" \
     --env "APP_ENV=production" \
     --auto-restart

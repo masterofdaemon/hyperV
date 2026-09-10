@@ -607,7 +607,7 @@ impl TaskManager {
                 if let Some(task) = self.find_task(id)? {
                     task.print_details();
                 } else {
-                    println!("❌ Task \"{}\" not found", id);
+                    return Err(HyperVError::TaskNotFound(id.to_string()));
                 }
             }
             None => {

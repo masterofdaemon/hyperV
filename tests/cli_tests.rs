@@ -32,6 +32,27 @@ fn bin_path(primary: &'static str, fallback: &'static str) -> &'static str {
     }
 }
 
+/// Best-effort `stop` guard so a mid-test panic still cleans up the spawned
+/// long-running process. Same Drop-based pattern as the `Reaper` in
+/// `test_daemon_locking`.
+struct StopGuard {
+    config_dir: std::path::PathBuf,
+    task: &'static str,
+}
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        let bin = assert_cmd::cargo::cargo_bin("hyperV");
+        let _ = std::process::Command::new(&bin)
+            .args(["stop", self.task])
+            .env("HYPERV_CONFIG_DIR", &self.config_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 #[test]
 fn test_help() {
     let temp = TempDir::new().unwrap();
@@ -49,6 +70,11 @@ fn test_help() {
 fn test_lifecycle() {
     let temp = TempDir::new().unwrap();
     let logger = abs_repo_path("tests/logger.sh");
+    // Stops the spawned logger even if an assertion panics mid-test.
+    let _guard = StopGuard {
+        config_dir: temp.path().to_path_buf(),
+        task: "test-task",
+    };
 
     // 1. Create a task
     hyperv_cmd(&temp)
@@ -129,11 +155,16 @@ fn test_persistence() {
 #[test]
 fn test_not_found() {
     let temp = TempDir::new().unwrap();
+    // `status` on a missing task exits non-zero like every other
+    // identifier-based command (start/stop/restart/remove/logs/diagnose),
+    // which all return `HyperVError::TaskNotFound`. The runtime prints the
+    // `Err` via `Debug`, so assert on the task name in stderr rather than
+    // the `Display` wording ("not found").
     hyperv_cmd(&temp)
         .args(&["status", "fake-task"])
         .assert()
-        .success() // CLI returns 0 but prints valid message usually
-        .stdout(predicate::str::contains("not found"));
+        .failure()
+        .stderr(predicate::str::contains("fake-task"));
 }
 
 #[test]
@@ -157,6 +188,11 @@ fn test_duplicate_task() {
 fn test_long_running() {
     let temp = TempDir::new().unwrap();
     let logger = abs_repo_path("tests/logger.sh");
+    // Stops the spawned logger even if an assertion panics mid-test.
+    let _guard = StopGuard {
+        config_dir: temp.path().to_path_buf(),
+        task: "sleeper",
+    };
 
     // Create a long running sleep task
     hyperv_cmd(&temp)
@@ -220,6 +256,11 @@ fn test_status_refreshes_finished_process() {
 fn test_restart_command() {
     let temp = TempDir::new().unwrap();
     let logger = abs_repo_path("tests/logger.sh");
+    // Stops the spawned logger even if an assertion panics mid-test.
+    let _guard = StopGuard {
+        config_dir: temp.path().to_path_buf(),
+        task: "restart-me",
+    };
 
     hyperv_cmd(&temp)
         .args(&["new", "--name", "restart-me", "--binary", &logger])
