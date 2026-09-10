@@ -41,9 +41,11 @@ impl TaskManager {
     fn get_process_memory_mb(sys: &mut System, pid: u32) -> u64 {
         let pid = Pid::from_u32(pid);
         if let Some(proc_) = sys.process(pid) {
-            // memory() returns bytes in sysinfo 0.30
+            // memory() returns bytes in sysinfo 0.30. Floor division truncates any
+            // process under 1 MiB RSS to 0, indistinguishable from "not running" -
+            // round up so a live process always shows at least 1 MB.
             let bytes = proc_.memory();
-            return bytes / (1024 * 1024); // Convert bytes to MB
+            return bytes.div_ceil(1024 * 1024);
         }
         0
     }
