@@ -1,3 +1,4 @@
+use hyperV::constants::MAX_RESTART_ATTEMPTS;
 use hyperV::{Task, TaskManager, TaskStatus};
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
@@ -99,13 +100,13 @@ fn exhausted_auto_restart_task_is_not_restarted_again() {
         let tasks_path = temp.path().join("tasks.json");
         let mut tasks = read_tasks(temp);
         tasks[0].status = TaskStatus::Failed;
-        tasks[0].restart_count = 5;
+        tasks[0].restart_count = MAX_RESTART_ATTEMPTS;
         std::fs::write(&tasks_path, serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
 
         manager.check_and_restart_tasks().unwrap();
 
         let tasks = read_tasks(temp);
-        assert_eq!(tasks[0].restart_count, 5);
+        assert_eq!(tasks[0].restart_count, MAX_RESTART_ATTEMPTS);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
         assert!(tasks[0].pid.is_none());
     });

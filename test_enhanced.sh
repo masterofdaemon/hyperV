@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 echo "Testing enhanced hyperV functionality..."
 
@@ -11,7 +12,8 @@ echo ""
 echo "1. Testing log following (will create a task that generates logs)"
 
 # Create a simple log-generating script
-cat > /tmp/log_generator.sh << 'EOF'
+LOG_GENERATOR=$(mktemp /tmp/log_generator.XXXXXX)
+cat > "$LOG_GENERATOR" << 'EOF'
 #!/bin/bash
 echo "Starting log generator..."
 for i in {1..10}; do
@@ -21,14 +23,14 @@ done
 echo "Log generator finished"
 EOF
 
-chmod +x /tmp/log_generator.sh
+chmod +x "$LOG_GENERATOR"
 
 # Test task creation with enhanced fields
 echo ""
 echo "2. Creating a test task..."
 ./target/release/hyperV new \
     --name "log-test" \
-    --binary "/tmp/log_generator.sh" \
+    --binary "$LOG_GENERATOR" \
     --auto-restart
 
 echo ""
@@ -45,7 +47,12 @@ echo "5. Showing logs..."
 
 echo ""
 echo "6. Testing log following for 3 seconds..."
-timeout 3s ./target/release/hyperV logs log-test --follow || true
+# Portable replacement for `timeout 3s` (not shipped on macOS by default).
+./target/release/hyperV logs log-test --follow &
+FOLLOW_PID=$!
+sleep 3
+kill "$FOLLOW_PID" 2>/dev/null || true
+wait "$FOLLOW_PID" 2>/dev/null || true
 
 echo ""
 echo "7. Stopping the task..."
@@ -58,7 +65,7 @@ echo "8. Final status check..."
 echo ""
 echo "9. Cleaning up..."
 ./target/release/hyperV remove log-test
-rm -f /tmp/log_generator.sh
+rm -f "$LOG_GENERATOR"
 
 echo ""
 echo "✅ Enhanced functionality test completed!"
