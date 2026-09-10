@@ -57,7 +57,7 @@ impl TaskManager {
             .map_err(HyperVError::Io)
     }
 
-    fn lock_tasks_for_update(&mut self) -> Result<fs::File> {
+    pub(crate) fn lock_tasks_for_update(&mut self) -> Result<fs::File> {
         let lock_file = self.tasks_lock_file()?;
         lock_file.lock_exclusive().map_err(HyperVError::Io)?;
         self.load_unlocked()?;
@@ -140,14 +140,7 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Save tasks to configuration file
-    pub(crate) fn save(&self) -> Result<()> {
-        let lock_file = self.tasks_lock_file()?;
-        lock_file.lock_exclusive().map_err(HyperVError::Io)?;
-        self.save_unlocked()
-    }
-
-    fn save_unlocked(&self) -> Result<()> {
+    pub(crate) fn save_unlocked(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.tasks)
             .map_err(|e| HyperVError::Serialization(e.to_string()))?;
 
@@ -207,7 +200,18 @@ impl TaskManager {
         auto_restart: bool,
     ) -> Result<()> {
         let _lock_file = self.lock_tasks_for_update()?;
+        self.create_task_unlocked(name, binary, args, env_vars, workdir, auto_restart)
+    }
 
+    pub(crate) fn create_task_unlocked(
+        &mut self,
+        name: String,
+        binary: String,
+        args: Vec<String>,
+        env_vars: Vec<String>,
+        workdir: Option<String>,
+        auto_restart: bool,
+    ) -> Result<()> {
         // Check if task name already exists
         if self.tasks.iter().any(|t| t.name == name) {
             return Err(HyperVError::TaskExists(name));
@@ -295,7 +299,7 @@ impl TaskManager {
             let started = task.last_started.as_deref().unwrap_or("-");
             println!(
                 "{:<36} {:<18} {:<15} {:<11} {:<20} {:<30}",
-                &task.id[..8],
+                task.id.get(..8).unwrap_or(&task.id),
                 task.name,
                 status_display,
                 mem_mb,
@@ -305,24 +309,49 @@ impl TaskManager {
         }
     }
 
-    /// Find a task by identifier (name, ID, or partial ID)
-    pub(crate) fn find_task(&self, identifier: &str) -> Option<&Task> {
-        self.tasks
+    fn find_task_index(&self, identifier: &str) -> Result<Option<usize>> {
+        if let Some(index) = self
+            .tasks
             .iter()
-            .find(|t| t.name == identifier || t.id == identifier || t.id.starts_with(identifier))
+            .position(|t| t.id == identifier || t.name == identifier)
+        {
+            return Ok(Some(index));
+        }
+        let mut matches = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.id.starts_with(identifier));
+        let first = matches.next().map(|(index, _)| index);
+        if matches.next().is_some() {
+            return Err(HyperVError::InvalidInput(format!(
+                "Ambiguous task identifier '{identifier}'"
+            )));
+        }
+        Ok(first)
     }
 
-    /// Find a mutable task by identifier
-    pub(crate) fn find_task_mut(&mut self, identifier: &str) -> Option<&mut Task> {
-        self.tasks
-            .iter_mut()
-            .find(|t| t.name == identifier || t.id == identifier || t.id.starts_with(identifier))
+    pub(crate) fn find_task(&self, identifier: &str) -> Result<Option<&Task>> {
+        Ok(self
+            .find_task_index(identifier)?
+            .map(|index| &self.tasks[index]))
+    }
+
+    pub(crate) fn find_task_mut(&mut self, identifier: &str) -> Result<Option<&mut Task>> {
+        Ok(self
+            .find_task_index(identifier)?
+            .map(|index| &mut self.tasks[index]))
     }
 
     /// Start a task
     pub fn start_task(&mut self, identifier: &str) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.start_task_unlocked(identifier)
+    }
+
+    pub(crate) fn start_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?
             .clone();
 
@@ -343,11 +372,11 @@ impl TaskManager {
                 return Err(HyperVError::TaskAlreadyRunning(task.name));
             } else {
                 // Process died, update status
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Failed);
                     task_mut.clear_pid();
                 }
-                self.save()?;
+                self.save_unlocked()?;
             }
         }
 
@@ -404,7 +433,7 @@ impl TaskManager {
             Ok(pid) => {
                 let pid_start_time = self.process_manager.process_start_time(pid);
                 // Update task state
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Running);
                     task_mut.set_pid(Some(pid));
                     task_mut.set_pid_start_time(pid_start_time);
@@ -412,7 +441,7 @@ impl TaskManager {
                     task_mut.clear_suppress_restart();
                 }
 
-                self.save()?;
+                self.save_unlocked()?;
                 self.save_running_tasks()?;
                 println!(
                     "✅ Task \"{}\" started successfully with PID {}",
@@ -422,10 +451,10 @@ impl TaskManager {
             }
             Err(e) => {
                 // Update task state to failed
-                if let Some(task_mut) = self.find_task_mut(identifier) {
+                if let Some(task_mut) = self.find_task_mut(identifier)? {
                     task_mut.set_status(TaskStatus::Failed);
                 }
-                self.save()?;
+                self.save_unlocked()?;
                 Err(e)
             }
         }
@@ -433,9 +462,14 @@ impl TaskManager {
 
     /// Stop a task
     pub fn stop_task(&mut self, identifier: &str) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.stop_task_unlocked(identifier)
+    }
+
+    pub(crate) fn stop_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let (task_name, task_id, pid, binary, pid_start_time) = {
             let task = self
-                .find_task(identifier)
+                .find_task(identifier)?
                 .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
             if task.status != TaskStatus::Running {
@@ -479,7 +513,8 @@ impl TaskManager {
             }
 
             println!("🛑 Stopping task \"{}\" (PID: {})...", task_name, pid);
-            self.process_manager.stop_task(&task_id, pid)?;
+            self.process_manager
+                .stop_task(&task_id, pid, &binary, pid_start_time)?;
             // Defensive: only mark stopped if the PID is actually gone.
             if self.process_manager.is_process_running(pid)
                 || self.process_manager.is_process_group_running(pid)
@@ -496,7 +531,8 @@ impl TaskManager {
                 "⚠️  Task \"{}\" PID {} is gone but its process group is still running; stopping group...",
                 task_name, pid
             );
-            self.process_manager.stop_task(&task_id, pid)?;
+            self.process_manager
+                .stop_task(&task_id, pid, &binary, pid_start_time)?;
             if self.process_manager.is_process_group_running(pid) {
                 return Err(HyperVError::ProcessStop(format!(
                     "Process group {} for task \"{}\" did not terminate",
@@ -505,13 +541,13 @@ impl TaskManager {
             }
         }
 
-        if let Some(task) = self.find_task_mut(identifier) {
+        if let Some(task) = self.find_task_mut(identifier)? {
             task.set_status(TaskStatus::Stopped);
             task.suppress_restart = true;
             task.clear_pid();
         }
 
-        self.save()?;
+        self.save_unlocked()?;
         self.save_running_tasks()?;
         println!("✅ Task \"{}\" stopped", task_name);
         Ok(())
@@ -519,39 +555,41 @@ impl TaskManager {
 
     /// Restart a task (stop if running, then start).
     pub fn restart_task(&mut self, identifier: &str) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
         let (task_name, is_running) = {
             let task = self
-                .find_task(identifier)
+                .find_task(identifier)?
                 .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
             (task.name.clone(), task.status == TaskStatus::Running)
         };
 
         if is_running {
-            self.stop_task(identifier)?;
+            self.stop_task_unlocked(identifier)?;
         }
 
-        self.start_task(&task_name)
+        self.start_task_unlocked(&task_name)
     }
 
     /// Remove a task
     pub fn remove_task(&mut self, identifier: &str) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
+        self.remove_task_unlocked(identifier)
+    }
+
+    pub(crate) fn remove_task_unlocked(&mut self, identifier: &str) -> Result<()> {
         let task_index = self
-            .tasks
-            .iter()
-            .position(|t| {
-                t.name == identifier || t.id == identifier || t.id.starts_with(identifier)
-            })
+            .find_task_index(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         // Check if task is running and stop it first
         let is_running = self.tasks[task_index].status == TaskStatus::Running;
         if is_running {
-            self.stop_task(identifier)?;
+            self.stop_task_unlocked(identifier)?;
         }
 
         let task_name = self.tasks[task_index].name.clone();
         self.tasks.remove(task_index);
-        self.save()?;
+        self.save_unlocked()?;
         self.save_running_tasks()?;
 
         println!("✅ Task \"{}\" removed", task_name);
@@ -564,7 +602,7 @@ impl TaskManager {
 
         match identifier {
             Some(id) => {
-                if let Some(task) = self.find_task(id) {
+                if let Some(task) = self.find_task(id)? {
                     task.print_details();
                 } else {
                     println!("❌ Task \"{}\" not found", id);
@@ -594,7 +632,7 @@ impl TaskManager {
         summary: bool,
     ) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         let stdout_path = self.config.stdout_log_path(&task.id);
@@ -606,7 +644,7 @@ impl TaskManager {
     /// Diagnose a task's binary
     pub fn diagnose_task(&self, identifier: &str) -> Result<()> {
         let task = self
-            .find_task(identifier)
+            .find_task(identifier)?
             .ok_or_else(|| HyperVError::TaskNotFound(identifier.to_string()))?;
 
         println!("🔍 Diagnosing task: {}", task.name);
@@ -629,12 +667,7 @@ impl TaskManager {
     pub fn check_and_restart_tasks(&mut self) -> Result<()> {
         use crate::constants::{MAX_RESTART_ATTEMPTS, RESTART_DELAY};
 
-        // Reload tasks from disk to pick up external changes (like suppression on stop)
-        if let Ok(content) = fs::read_to_string(&self.config.tasks_file)
-            && let Ok(tasks_on_disk) = serde_json::from_str::<Vec<Task>>(&content)
-        {
-            self.tasks = tasks_on_disk;
-        }
+        let _lock_file = self.lock_tasks_for_update()?;
 
         let tasks_to_restart: Vec<String> = self
             .tasks
@@ -659,18 +692,18 @@ impl TaskManager {
 
                 task.increment_restart_count();
                 let task_name = task.name.clone();
-                self.save()?;
+                self.save_unlocked()?;
 
                 // Small delay before restart
                 std::thread::sleep(RESTART_DELAY);
 
-                if let Err(e) = self.start_task(&task_name) {
+                if let Err(e) = self.start_task_unlocked(&task_name) {
                     println!("❌ Failed to auto-restart task \"{}\": {}", task_name, e);
                     // Mark as failed again if restart fails
-                    if let Some(task_mut) = self.find_task_mut(&task_name) {
+                    if let Some(task_mut) = self.find_task_mut(&task_name)? {
                         task_mut.set_status(TaskStatus::Failed);
                     }
-                    self.save()?;
+                    self.save_unlocked()?;
                 } else {
                     println!("✅ Task \"{}\" restarted successfully", task_name);
                 }
@@ -682,6 +715,7 @@ impl TaskManager {
 
     /// Refresh task statuses by checking if running processes are still alive
     pub fn refresh_task_statuses(&mut self) -> Result<()> {
+        let _lock_file = self.lock_tasks_for_update()?;
         let mut updated = false;
 
         for task in &mut self.tasks {
@@ -710,7 +744,7 @@ impl TaskManager {
         }
 
         if updated {
-            self.save()?;
+            self.save_unlocked()?;
             self.save_running_tasks()?;
         }
 
@@ -747,12 +781,7 @@ impl TaskManager {
 
     /// Clean up zombie processes, update task states, and return tasks that failed in this pass.
     pub fn cleanup_with_events(&mut self) -> Result<Vec<Task>> {
-        // Reload tasks from disk to incorporate external updates (e.g., stop suppression)
-        if let Ok(content) = fs::read_to_string(&self.config.tasks_file)
-            && let Ok(tasks_on_disk) = serde_json::from_str::<Vec<Task>>(&content)
-        {
-            self.tasks = tasks_on_disk;
-        }
+        let _lock_file = self.lock_tasks_for_update()?;
 
         let exit_codes = self.process_manager.cleanup_zombies();
 
@@ -790,7 +819,7 @@ impl TaskManager {
         }
 
         if changed {
-            self.save()?;
+            self.save_unlocked()?;
             self.save_running_tasks()?;
         }
 

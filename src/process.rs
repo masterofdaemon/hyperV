@@ -250,7 +250,18 @@ impl ProcessManager {
     }
 
     /// Stop a task process gracefully
-    pub fn stop_task(&mut self, task_id: &str, pid: u32) -> Result<()> {
+    pub fn stop_task(
+        &mut self,
+        task_id: &str,
+        pid: u32,
+        binary: &str,
+        pid_start_time: Option<u64>,
+    ) -> Result<()> {
+        if Self::is_pid_running(pid) && !self.pid_matches_identity(pid, binary, pid_start_time) {
+            return Err(HyperVError::ProcessStop(format!(
+                "Refusing to stop PID {pid}: PID appears to have been reused"
+            )));
+        }
         // Take ownership of the Child so we can poll/reap without borrowing self.
         // If the process doesn't actually terminate, we reinsert it.
         let mut child = self.running_processes.remove(task_id);
@@ -356,6 +367,9 @@ impl ProcessManager {
                 }
 
                 let errno = std::io::Error::last_os_error();
+                if let Some(c) = child.take() {
+                    self.running_processes.insert(task_id.to_string(), c);
+                }
                 return Err(HyperVError::ProcessStop(format!(
                     "Failed to send SIGTERM to process {} or its children (errno: {})",
                     pid, errno
@@ -430,7 +444,31 @@ impl ProcessManager {
 
     /// Validate that a binary file exists and is executable
     fn validate_binary(&self, binary_path: &str) -> Result<()> {
-        let path = Path::new(binary_path);
+        let resolved = if Path::new(binary_path).components().count() == 1 {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(binary_path))
+                    .find(|path| {
+                        path.is_file() && {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                path.metadata()
+                                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                true
+                            }
+                        }
+                    })
+            })
+        } else {
+            None
+        };
+        let path = resolved
+            .as_deref()
+            .unwrap_or_else(|| Path::new(binary_path));
 
         // Check if file exists
         if !path.exists() {
