@@ -32,6 +32,10 @@ pub mod constants {
     /// Maximum number of automatic restart attempts
     pub const MAX_RESTART_ATTEMPTS: u32 = 5;
 
+    /// How long a run must last before earlier restarts stop counting against
+    /// MAX_RESTART_ATTEMPTS, so the limit bounds a crash loop, not the task's lifetime
+    pub const RESTART_STABILITY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
     /// Delay between restart attempts
     pub const RESTART_DELAY: Duration = Duration::from_secs(1);
 

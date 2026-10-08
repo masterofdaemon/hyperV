@@ -1,4 +1,4 @@
-use hyperV::constants::MAX_RESTART_ATTEMPTS;
+use hyperV::constants::{MAX_RESTART_ATTEMPTS, RESTART_STABILITY_WINDOW};
 use hyperV::{Task, TaskManager, TaskStatus};
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
@@ -81,34 +81,116 @@ fn stale_manager_does_not_overwrite_newer_tasks_on_create() {
     });
 }
 
+fn create_auto_restart_task(manager: &mut TaskManager, name: &str, binary: &str, args: &[&str]) {
+    manager
+        .create_task(
+            name.to_string(),
+            binary.to_string(),
+            args.iter().map(|arg| arg.to_string()).collect(),
+            Vec::new(),
+            None,
+            true,
+        )
+        .unwrap();
+}
+
+fn edit_first_task(temp: &TempDir, edit: impl FnOnce(&mut Task)) {
+    let mut tasks = read_tasks(temp);
+    edit(&mut tasks[0]);
+    std::fs::write(
+        temp.path().join("tasks.json"),
+        serde_json::to_string_pretty(&tasks).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Run daemon cleanup ticks until one of them reports a task whose process died.
+fn cleanup_until_task_failed(manager: &mut TaskManager) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while manager.cleanup_with_events().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task process never observed dead"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
-fn exhausted_auto_restart_task_is_not_restarted_again() {
+fn task_dying_inside_stability_window_stays_capped_at_max_restarts() {
     with_temp_config(|temp| {
         let true_bin = bin_path("/bin/true", "/usr/bin/true");
         let mut manager = TaskManager::new().unwrap();
-        manager
-            .create_task(
-                "exhausted".to_string(),
-                true_bin.to_string(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                true,
-            )
-            .unwrap();
+        create_auto_restart_task(&mut manager, "crash-loop", true_bin, &[]);
+        manager.start_task("crash-loop").unwrap();
+        edit_first_task(temp, |task| task.restart_count = MAX_RESTART_ATTEMPTS - 1);
 
-        let tasks_path = temp.path().join("tasks.json");
-        let mut tasks = read_tasks(temp);
-        tasks[0].status = TaskStatus::Failed;
-        tasks[0].restart_count = MAX_RESTART_ATTEMPTS;
-        std::fs::write(&tasks_path, serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
+        // Last attempt of the budget: restarted once more, then it exits again right away.
+        cleanup_until_task_failed(&mut manager);
+        manager.check_and_restart_tasks().unwrap();
+        assert_eq!(read_tasks(temp)[0].restart_count, MAX_RESTART_ATTEMPTS);
 
+        cleanup_until_task_failed(&mut manager);
         manager.check_and_restart_tasks().unwrap();
 
         let tasks = read_tasks(temp);
         assert_eq!(tasks[0].restart_count, MAX_RESTART_ATTEMPTS);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
         assert!(tasks[0].pid.is_none());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn exhausted_task_is_restarted_again_after_a_stable_run() {
+    with_temp_config(|temp| {
+        let mut manager = TaskManager::new().unwrap();
+        create_auto_restart_task(&mut manager, "stable", "sleep", &["60"]);
+        manager.start_task("stable").unwrap();
+        let pid = read_tasks(temp)[0].pid.unwrap();
+
+        // The budget was spent in an old crash loop; the current run has outlived the window.
+        edit_first_task(temp, |task| {
+            task.restart_count = MAX_RESTART_ATTEMPTS;
+            task.last_started = Some(
+                (chrono::Utc::now() - RESTART_STABILITY_WINDOW - chrono::Duration::seconds(1))
+                    .to_rfc3339(),
+            );
+        });
+        manager.cleanup_with_events().unwrap();
+        assert_eq!(read_tasks(temp)[0].restart_count, 0);
+
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        cleanup_until_task_failed(&mut manager);
+        manager.check_and_restart_tasks().unwrap();
+
+        let task = read_tasks(temp).remove(0);
+        manager.stop_task("stable").unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.restart_count, 1);
+    });
+}
+
+#[test]
+fn operator_start_gives_exhausted_task_a_fresh_restart_budget() {
+    with_temp_config(|temp| {
+        let mut manager = TaskManager::new().unwrap();
+        create_auto_restart_task(&mut manager, "retry", "sleep", &["60"]);
+        edit_first_task(temp, |task| {
+            task.status = TaskStatus::Failed;
+            task.restart_count = MAX_RESTART_ATTEMPTS;
+        });
+
+        manager.start_task("retry").unwrap();
+        let after_start = read_tasks(temp)[0].restart_count;
+
+        edit_first_task(temp, |task| task.restart_count = MAX_RESTART_ATTEMPTS);
+        manager.restart_task("retry").unwrap();
+        let after_restart = read_tasks(temp)[0].restart_count;
+
+        manager.stop_task("retry").unwrap();
+        assert_eq!(after_start, 0);
+        assert_eq!(after_restart, 0);
     });
 }
 

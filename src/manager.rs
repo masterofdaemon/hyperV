@@ -381,6 +381,15 @@ impl TaskManager {
     /// Start a task
     pub fn start_task(&mut self, identifier: &str) -> Result<()> {
         let _lock_file = self.lock_tasks_for_update()?;
+        self.start_task_by_operator_unlocked(identifier)
+    }
+
+    /// An explicit start/restart is the operator saying "try again", so it comes with a fresh
+    /// auto-restart budget. The daemon's own restarts go through `start_task_unlocked` directly.
+    fn start_task_by_operator_unlocked(&mut self, identifier: &str) -> Result<()> {
+        if let Some(task) = self.find_task_mut(identifier)? {
+            task.restart_count = 0;
+        }
         self.start_task_unlocked(identifier)
     }
 
@@ -604,7 +613,7 @@ impl TaskManager {
             self.stop_task_unlocked(identifier)?;
         }
 
-        self.start_task_unlocked(&task_name)
+        self.start_task_by_operator_unlocked(&task_name)
     }
 
     /// Remove a task
@@ -825,10 +834,25 @@ impl TaskManager {
         // Update task states for processes that are no longer running
         let mut changed = false;
         let mut failed_tasks = Vec::new();
+        let stable_cutoff = Utc::now() - crate::constants::RESTART_STABILITY_WINDOW;
         for task in &mut self.tasks {
             if task.status == TaskStatus::Running
                 && let Some(pid) = task.pid
             {
+                // A run that outlived the stability window ends the crash loop, so the next
+                // failure gets a full restart budget. Checked before the liveness test so a run
+                // found dead on this pass (e.g. after a reboot) is credited too.
+                // ponytail: uptime is now - last_started, so daemon downtime counts as uptime;
+                // record the observed death time if that ever grants budgets it should not.
+                if task.restart_count > 0 && task.started_by(stable_cutoff) {
+                    println!(
+                        "♻️  Task \"{}\" ran past the stability window; restart count {} reset to 0",
+                        task.name, task.restart_count
+                    );
+                    task.restart_count = 0;
+                    changed = true;
+                }
+
                 let pid_running = self.process_manager.is_process_running(pid);
                 let group_running = self.process_manager.is_process_group_running(pid);
                 let matches = !pid_running

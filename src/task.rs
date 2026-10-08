@@ -123,6 +123,14 @@ impl Task {
         self.restart_count += 1;
     }
 
+    /// Whether the last start happened at or before `cutoff` (false if never started)
+    pub fn started_by(&self, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+        self.last_started
+            .as_deref()
+            .and_then(|started| chrono::DateTime::parse_from_rfc3339(started).ok())
+            .is_some_and(|started| started <= cutoff)
+    }
+
     /// Set last exit code
     pub fn set_exit_code(&mut self, exit_code: Option<i32>) {
         self.last_exit_code = exit_code;

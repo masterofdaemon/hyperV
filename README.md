@@ -192,6 +192,8 @@ Tasks with `--auto-restart` flag will automatically restart if they fail (up to 
 hyperV new --name "critical-service" --binary "/path/to/service" --auto-restart
 ```
 
+The 5 attempts are a crash-loop budget, not a lifetime one. The counter goes back to 0 once a run lasts 10 minutes, and whenever you run `hyperV start` or `hyperV restart` yourself.
+
 ### Telegram failure alerts
 The daemon can send Telegram messages when a service is in real trouble:
 - A task crashes 2 times within 10 minutes
@@ -269,7 +271,7 @@ Each task contains:
 - `pid_start_time`: Process identity timestamp used to reduce PID-reuse mistakes
 - `created_at`: Creation timestamp
 - `last_started`: Last start timestamp
-- `restart_count`: Number of automatic restarts
+- `restart_count`: Number of automatic restarts since the task last ran for 10 minutes or was started by hand
 - `last_exit_code`: Exit code from last run
 - `suppress_restart`: Internal flag that prevents an explicitly stopped task from being auto-restarted
 - `stdout_log_path`: Path to stdout log file
