@@ -387,4 +387,47 @@ while true; do sleep 1; done
         pm.stop_task(&task.id, pid, &task.binary, pm.process_start_time(pid))
             .expect("stop_task cleanup");
     }
+
+    #[test]
+    fn stop_task_succeeds_when_dead_leader_is_a_zombie_owned_by_another_process() {
+        use std::os::unix::process::CommandExt;
+
+        // The daemon is the parent of every task it restarts, so `hyperV stop` (a different
+        // process) can never reap the leader: it lingers as a zombie until the daemon's next
+        // tick. Model that by spawning outside the ProcessManager and never waiting.
+        let sleep_bin = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let mut child = std::process::Command::new(sleep_bin)
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let _guard = KillGroupOnDrop { pgid: pid };
+        let mut pm = ProcessManager::new();
+        let start_time = pm.process_start_time(pid);
+
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        // Wait for the exit without reaping, so the process stays a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(rc, 0, "waitid should observe the exit");
+
+        assert!(
+            !pm.is_process_running(pid),
+            "a zombie is not a running process"
+        );
+        assert!(
+            !pm.is_process_group_running(pid),
+            "a group holding only a zombie is not running"
+        );
+        pm.stop_task("zombie", pid, sleep_bin, start_time)
+            .expect("stop must not wait on a zombie");
+
+        child.wait().expect("reap");
+    }
 }

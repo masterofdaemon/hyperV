@@ -28,52 +28,28 @@ impl ProcessManager {
     }
 
     fn is_pid_running(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // kill(pid, 0) doesn't send a signal; it only performs error checking.
-            // - ESRCH: no such process
-            // - EPERM: process exists but we don't have permission (treat as running)
-            use libc::kill;
-            // A u32 PID that doesn't fit in pid_t (i32) cannot refer to a live
-            // process; reject it instead of silently wrapping via `as`.
-            let Ok(pid) = i32::try_from(pid) else {
-                return false;
-            };
-            let rc = unsafe { kill(pid, 0) };
-            if rc == 0 {
-                return true;
-            }
-            let err = std::io::Error::last_os_error();
-            !matches!(err.raw_os_error(), Some(libc::ESRCH))
-        }
-
-        #[cfg(not(unix))]
-        {
-            use sysinfo::{Pid, System};
-            let mut system = System::new();
-            let pid = Pid::from_u32(pid);
-            system.refresh_process(pid)
-        }
+        // Not kill(pid, 0): that also succeeds for a zombie, which only its parent's wait()
+        // can clear. sysinfo hides macOS zombies and labels Linux ones.
+        use sysinfo::{Pid, ProcessStatus, System};
+        let mut system = System::new();
+        let pid = Pid::from_u32(pid);
+        system.refresh_process(pid)
+            && system
+                .process(pid)
+                .is_some_and(|p| p.status() != ProcessStatus::Zombie)
     }
 
     fn is_pgid_running(pgid: u32) -> bool {
         #[cfg(unix)]
         {
-            use libc::kill;
-            // Reject unrepresentable PGIDs instead of wrapping via `as`
-            // (a wrapped negative value would probe the wrong process group).
-            let Ok(pgid) = i32::try_from(pgid) else {
-                return false;
-            };
-            let Some(neg_pgid) = pgid.checked_neg() else {
-                return false;
-            };
-            let rc = unsafe { kill(neg_pgid, 0) };
-            if rc == 0 {
-                return true;
-            }
-            let err = std::io::Error::last_os_error();
-            !matches!(err.raw_os_error(), Some(libc::ESRCH))
+            // See is_pid_running: kill(-pgid, 0) reports a group holding only zombies as alive.
+            use sysinfo::{ProcessStatus, System};
+            let mut system = System::new();
+            system.refresh_processes();
+            system.processes().iter().any(|(pid, process)| {
+                process.status() != ProcessStatus::Zombie
+                    && Self::process_group_id(pid.as_u32()) == Some(pgid)
+            })
         }
 
         #[cfg(not(unix))]
