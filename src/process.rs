@@ -13,6 +13,47 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// What `kill(pid, 0)` / `kill(-pgid, 0)` reported.
+///
+/// `ESRCH` is dead. Success and `EPERM` (any other errno) both mean the
+/// target still exists; success also succeeds for zombies.
+#[cfg(unix)]
+enum KillProbe {
+    Dead,
+    Exists,
+    Unsignalable,
+}
+
+/// Single-pid view from sysinfo. macOS hides zombies (`Unseen`); Linux labels them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PidView {
+    Live,
+    Zombie,
+    Unseen,
+}
+
+/// Whether a process group still has a member that is not a zombie.
+#[cfg(unix)]
+enum GroupView {
+    LiveMember,
+    OnlyZombies,
+    NoVisibleMember,
+}
+
+/// State and process-group id from `/proc/<pid>/stat`.
+///
+/// `comm` is wrapped in parentheses and may contain spaces or `)`, so the
+/// fields after the last `)` are `state`, `ppid`, `pgrp`.
+#[cfg(target_os = "linux")]
+fn stat_state_and_pgrp(stat: &str) -> Option<(char, i32)> {
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
 /// Process manager for handling running tasks
 pub struct ProcessManager {
     /// Currently running processes
@@ -28,34 +69,175 @@ impl ProcessManager {
     }
 
     fn is_pid_running(pid: u32) -> bool {
-        // Not kill(pid, 0): that also succeeds for a zombie, which only its parent's wait()
-        // can clear. sysinfo hides macOS zombies and labels Linux ones.
-        use sysinfo::{Pid, ProcessStatus, System};
-        let mut system = System::new();
-        let pid = Pid::from_u32(pid);
-        system.refresh_process(pid)
-            && system
-                .process(pid)
-                .is_some_and(|p| p.status() != ProcessStatus::Zombie)
+        #[cfg(unix)]
+        {
+            // kill(pid, 0) is the cheap existence check. It also succeeds for a
+            // zombie, so a positive result still has to be confirmed below.
+            match Self::kill_probe(pid, false) {
+                KillProbe::Dead => false,
+                KillProbe::Exists => Self::sysinfo_pid_view(pid) == PidView::Live,
+                // EPERM: the process exists, but we may not be able to inspect it.
+                // Treat that as alive unless sysinfo positively reports a zombie.
+                KillProbe::Unsignalable => Self::sysinfo_pid_view(pid) != PidView::Zombie,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Self::sysinfo_pid_view(pid) == PidView::Live
+        }
     }
 
     fn is_pgid_running(pgid: u32) -> bool {
         #[cfg(unix)]
         {
-            // See is_pid_running: kill(-pgid, 0) reports a group holding only zombies as alive.
-            use sysinfo::{ProcessStatus, System};
-            let mut system = System::new();
-            system.refresh_processes();
-            system.processes().iter().any(|(pid, process)| {
-                process.status() != ProcessStatus::Zombie
-                    && Self::process_group_id(pid.as_u32()) == Some(pgid)
-            })
+            // Same split as is_pid_running: ESRCH returns before any process walk.
+            match Self::kill_probe(pgid, true) {
+                KillProbe::Dead => false,
+                probe => match Self::inspect_group(pgid) {
+                    GroupView::LiveMember => true,
+                    GroupView::OnlyZombies => false,
+                    GroupView::NoVisibleMember => matches!(probe, KillProbe::Unsignalable),
+                },
+            }
         }
 
         #[cfg(not(unix))]
         {
             let _ = pgid;
             false
+        }
+    }
+
+    /// `kill(id, 0)` or, when `group` is set, `kill(-id, 0)`.
+    ///
+    /// Ids that do not fit in `pid_t` are dead. Negating the group id uses
+    /// `checked_neg` so `i32::MIN` cannot wrap into a different target.
+    #[cfg(unix)]
+    fn kill_probe(id: u32, group: bool) -> KillProbe {
+        let Ok(id) = i32::try_from(id) else {
+            return KillProbe::Dead;
+        };
+        let target = if group {
+            let Some(negated) = id.checked_neg() else {
+                return KillProbe::Dead;
+            };
+            negated
+        } else {
+            id
+        };
+        // Safety: signal 0 does not deliver a signal; it only checks existence.
+        let rc = unsafe { libc::kill(target, 0) };
+        if rc == 0 {
+            return KillProbe::Exists;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            KillProbe::Dead
+        } else {
+            KillProbe::Unsignalable
+        }
+    }
+
+    /// Refresh this pid only. `ProcessRefreshKind::new()` still fills `status`.
+    fn sysinfo_pid_view(pid: u32) -> PidView {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, System};
+        let mut system = System::new();
+        let pid = Pid::from_u32(pid);
+        if !system.refresh_process_specifics(pid, ProcessRefreshKind::new()) {
+            return PidView::Unseen;
+        }
+        match system.process(pid).map(|process| process.status()) {
+            Some(ProcessStatus::Zombie) => PidView::Zombie,
+            Some(_) => PidView::Live,
+            None => PidView::Unseen,
+        }
+    }
+
+    #[cfg(unix)]
+    fn inspect_group(pgid: u32) -> GroupView {
+        #[cfg(target_os = "linux")]
+        {
+            // `/proc/<pid>/stat` carries state and pgrp together, so a live
+            // leader (pid == pgid for tasks started with `process_group(0)`)
+            // is one file read. The full directory walk runs only when that
+            // leader is gone or a zombie and some other member might remain.
+            if let Some(view) = Self::inspect_group_linux(pgid) {
+                return view;
+            }
+        }
+        Self::inspect_group_sysinfo(pgid)
+    }
+
+    /// `Some(true)` live member, `Some(false)` zombie member, `None` otherwise.
+    #[cfg(target_os = "linux")]
+    fn proc_group_membership(pid: u32, pgid: i32) -> Option<bool> {
+        let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (state, member_pgid) = stat_state_and_pgrp(&content)?;
+        if member_pgid != pgid {
+            return None;
+        }
+        Some(state != 'Z')
+    }
+
+    /// `None` when `/proc` cannot be listed, so the caller can fall back.
+    #[cfg(target_os = "linux")]
+    fn inspect_group_linux(pgid: u32) -> Option<GroupView> {
+        let pgid_i = i32::try_from(pgid).ok()?;
+        if Self::proc_group_membership(pgid, pgid_i) == Some(true) {
+            return Some(GroupView::LiveMember);
+        }
+        let entries = fs::read_dir("/proc").ok()?;
+        let mut saw_member = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else {
+                continue;
+            };
+            if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(pid) = text.parse::<u32>() else {
+                continue;
+            };
+            match Self::proc_group_membership(pid, pgid_i) {
+                Some(true) => return Some(GroupView::LiveMember),
+                Some(false) => saw_member = true,
+                None => {}
+            }
+        }
+        Some(if saw_member {
+            GroupView::OnlyZombies
+        } else {
+            GroupView::NoVisibleMember
+        })
+    }
+
+    #[cfg(unix)]
+    fn inspect_group_sysinfo(pgid: u32) -> GroupView {
+        if Self::sysinfo_pid_view(pgid) == PidView::Live
+            && Self::process_group_id(pgid) == Some(pgid)
+        {
+            return GroupView::LiveMember;
+        }
+
+        use sysinfo::{ProcessRefreshKind, ProcessStatus, System};
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessRefreshKind::new());
+        let mut saw_member = false;
+        for (pid, process) in system.processes() {
+            if Self::process_group_id(pid.as_u32()) != Some(pgid) {
+                continue;
+            }
+            if process.status() != ProcessStatus::Zombie {
+                return GroupView::LiveMember;
+            }
+            saw_member = true;
+        }
+        if saw_member {
+            GroupView::OnlyZombies
+        } else {
+            GroupView::NoVisibleMember
         }
     }
 
@@ -291,37 +473,39 @@ impl ProcessManager {
 
         let mut wait_for_exit = |timeout: Duration| -> bool {
             let start = Instant::now();
-            while start.elapsed() < timeout {
-                if let Some(c) = child.as_mut() {
-                    // try_wait() reaps the child if it exited.
-                    let exited = matches!(c.try_wait(), Ok(Some(_)));
-                    if exited {
-                        child.take();
-                        return true;
-                    }
+            let group_stopped = |child: &mut Option<Child>| -> bool {
+                if Self::is_pid_running(pid) || Self::is_pgid_running(pid) {
+                    return false;
                 }
-
-                if !Self::is_pid_running(pid) && !Self::is_pgid_running(pid) {
-                    // If the OS no longer reports it running, best-effort reap to avoid zombies.
-                    if let Some(mut c) = child.take() {
-                        let _ = c.try_wait();
-                        let _ = c.wait();
-                    }
+                // Reap only after the group is gone. A leader can exit while a
+                // background child keeps the process group alive.
+                if let Some(mut c) = child.take() {
+                    let _ = c.try_wait();
+                    let _ = c.wait();
+                }
+                true
+            };
+            // try_wait() reaps an exited leader. That alone is not success:
+            // liveness is decided by the checks below.
+            let reap_exited_leader = |child: &mut Option<Child>| {
+                let exited = child
+                    .as_mut()
+                    .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+                if exited {
+                    child.take();
+                }
+            };
+            while start.elapsed() < timeout {
+                reap_exited_leader(&mut child);
+                if group_stopped(&mut child) {
                     return true;
                 }
 
                 thread::sleep(Duration::from_millis(100));
             }
 
-            // One final check at the boundary.
-            if let Some(c) = child.as_mut() {
-                let exited = matches!(c.try_wait(), Ok(Some(_)));
-                if exited {
-                    child.take();
-                    return true;
-                }
-            }
-            !Self::is_pid_running(pid) && !Self::is_pgid_running(pid)
+            reap_exited_leader(&mut child);
+            group_stopped(&mut child)
         };
 
         // First check if the process is actually running
@@ -710,4 +894,21 @@ pub fn diagnose_binary(binary_path: &str) -> Result<()> {
     println!();
     println!("🎯 Diagnosis complete - binary appears valid");
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stat_parse_tests {
+    use super::stat_state_and_pgrp;
+
+    #[test]
+    fn reads_state_and_pgrp_when_comm_contains_parentheses() {
+        let stat = "42 (a) b) S 1 99 99 0\n";
+        assert_eq!(stat_state_and_pgrp(stat), Some(('S', 99)));
+    }
+
+    #[test]
+    fn reads_zombie_state() {
+        let stat = "7 (sleep) Z 1 7 7 0\n";
+        assert_eq!(stat_state_and_pgrp(stat), Some(('Z', 7)));
+    }
 }
